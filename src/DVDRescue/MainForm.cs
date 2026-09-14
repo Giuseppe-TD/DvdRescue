@@ -530,8 +530,8 @@ public partial class MainForm : Form
                     _ => 0
                 };
 
-                bool thorough = chkThorough.Checked;
-                var opened = await Task.Run(() => DriveAccess.Open(entry.Letter, speed, thorough, Log, ct), ct);
+                var opened = await Task.Run(
+                    () => DriveAccess.Open(entry.Letter, speed, chkThorough.Checked, Log, ct), ct);
                 _drive = opened.Drive;
                 _source = opened.Source;
                 mediaText = opened.MediaText;
@@ -556,6 +556,7 @@ public partial class MainForm : Form
 
             var source = _source;
             bool deep = chkDeepScan.Checked;
+            bool thorough = chkThorough.Checked;
             bool preciseSplit = cmbSplit.SelectedIndex != 0;   // serve solo se i file vanno separati
             var textProgress = CreateTextProgress();
 
@@ -566,6 +567,39 @@ public partial class MainForm : Form
                 r.DiscStatusText = statusText;
                 return r;
             }, ct);
+
+            // Se il primo giro non trova niente si riprova da soli col metodo più ostinato,
+            // invece di rimandare la palla all'utente: su un disco messo male la differenza
+            // fra "nessun video" e quaranta minuti di riprese è tutta lì.
+            if (result.Titles.Count == 0 && !(deep && thorough))
+            {
+                Log("Nessun video col metodo veloce: riprovo con scansione approfondita e recupero insistente.");
+
+                if (_source is OpticalBlockSource optical)
+                {
+                    optical.ThoroughMode = true;
+                    optical.ResetEndOfData();
+                }
+
+                var second = await Task.Run(() =>
+                {
+                    var r = RecoveryEngine.Analyze(source, true, verifyLimit, textProgress, Log, ct, preciseSplit);
+                    r.MediaText = mediaText;
+                    r.DiscStatusText = statusText;
+                    return r;
+                }, ct);
+
+                if (second.Titles.Count > 0)
+                {
+                    Log($"Il secondo tentativo ha trovato {second.Titles.Count} video: " +
+                        "su questo disco servono le letture insistenti.");
+                    result = second;
+                }
+                else
+                {
+                    Log("Niente nemmeno col secondo tentativo.");
+                }
+            }
 
             _result = result;
             foreach (var note in result.Notes) Log("· " + note);

@@ -82,7 +82,19 @@ with open('raw_grande.bin', 'wb') as out:
 print("raw_grande.bin creato")
 PY
 
-echo "6/6 pulizia..."
+echo "6/7 costruisco un disco in cui il video non comincia subito..."
+python3 - <<'PY'
+S = 2048
+a = open('t1.mpg', 'rb').read()
+# come un DVD-RW formattato in modalità VR: la testa del disco è occupata da strutture
+# e riserve, e il video comincia decine di megabyte più avanti
+with open('raw_offset.bin', 'wb') as out:
+    out.write(b'\x00' * (60 * 1024 * 1024))
+    out.write(a)
+print("raw_offset.bin creato")
+PY
+
+echo "7/7 pulizia..."
 rm -rf dvd dvd2
 ls -lh dvd.iso dvd2.iso raw.bin
 

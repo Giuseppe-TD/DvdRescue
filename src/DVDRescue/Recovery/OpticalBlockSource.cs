@@ -73,6 +73,7 @@ public sealed class OpticalBlockSource : BlockSourceBase
         if (_drive.ReadSectors(block, count, destination, destinationOffset, ReadTimeout).Success)
         {
             ConsecutiveFailures = 0;
+            _readSomething = true;
             return count;
         }
 
@@ -104,6 +105,7 @@ public sealed class OpticalBlockSource : BlockSourceBase
             if (_drive.ReadSectors(block, 1, destination, destinationOffset, ReadTimeout).Success)
             {
                 ConsecutiveFailures = 0;
+                _readSomething = true;
                 return true;
             }
 
@@ -111,6 +113,7 @@ public sealed class OpticalBlockSource : BlockSourceBase
                 _drive.ReadSectorsAlternate(block, 1, destination, destinationOffset, ReadTimeout).Success)
             {
                 ConsecutiveFailures = 0;
+                _readSomething = true;
                 return true;
             }
 
@@ -122,13 +125,18 @@ public sealed class OpticalBlockSource : BlockSourceBase
         return false;
     }
 
+    private bool _readSomething;
+
     private void RegisterFailure(long block, int count)
     {
         _bad += count;
         ConsecutiveFailures += count;
 
         if (BadSectors.Count < 50000) BadSectors.Add(block);
-        if (ConsecutiveFailures >= ConsecutiveFailuresLimit) ReachedEndOfData = true;
+
+        // "fine dell'area scritta" ha senso solo dopo aver letto qualcosa: se il disco comincia
+        // con una zona illeggibile, fermarsi lì vorrebbe dire non trovare mai niente
+        if (_readSomething && ConsecutiveFailures >= ConsecutiveFailuresLimit) ReachedEndOfData = true;
     }
 
     /// <summary>Lettura secca, timeout corto, nessun ritentativo: serve solo a sondare.</summary>

@@ -205,6 +205,25 @@ Il file è `%APPDATA%\DVDRescue\impostazioni.json`: niente registro e niente ins
 spostare la configurazione su un altro computer basta copiarlo. Se si rovina o si cancella, il
 programma riparte dai valori predefiniti senza lamentarsi.
 
+## Se il primo tentativo non trova niente, ci riprova da solo
+
+Il metodo veloce va bene sulla maggior parte dei dischi, ma su un supporto vecchio o rovinato
+può non bastare: i settori che al primo colpo non rispondono vengono lasciati perdere, e se
+capitano proprio dove sta il video il risultato è "nessun video individuato".
+
+Quando succede il programma **non si ferma lì e non chiede niente**: rifà l'analisi da solo con
+la scansione approfondita e il recupero insistente, e lo scrive nel registro. Su un DVD-RW del
+2006 questa è la differenza fra un disco apparentemente vuoto e quaranta minuti di riprese.
+
+Le due caselle restano a disposizione per partire subito in modalità ostinata quando si sa già
+che il disco è messo male, ma non c'è bisogno di ricordarsene: servono a risparmiare il primo
+tentativo, non a far funzionare il programma.
+
+Un'altra cosa che il metodo veloce ora gestisce: il video non sempre comincia all'inizio del
+disco. Su un DVD-RW formattato in modalità VR la testa è occupata da strutture e riserve, e la
+prima ripresa parte anche decine di megabyte più avanti — la ricerca rapida arriva fino a 256 MB
+prima di rinunciare.
+
 ## Se non trova niente
 
 - **Prova un altro lettore.** È il consiglio che risolve più spesso: non tutti i masterizzatori

@@ -558,23 +558,48 @@ public static class RecoveryEngine
 
         var buffer = new byte[window * 2048];
 
-        // primo settore video: nei primi megabyte c'è l'area di sistema, poi comincia il video
+        // Primo settore video. Non sempre comincia subito: su un disco formattato in modalità VR
+        // la testa del disco è occupata da strutture e riserve, e il video parte anche decine di
+        // megabyte più avanti. Quindi si assaggia a salti per un buon tratto, e quando si trova
+        // qualcosa si torna indietro a cercare il punto esatto.
         long start = -1;
-        for (long sector = firstSector; sector < Math.Min(firstSector + window * 8, lastSector); sector += window)
+        long probeStep = window * 8;                                   // un assaggio ogni 8 MB
+        long probeLimit = Math.Min(lastSector, firstSector + window * 128);   // fino a 256 MB
+        long foundAt = -1;
+
+        for (long sector = firstSector; sector < probeLimit && foundAt < 0; sector += probeStep)
         {
             int count = (int)Math.Min(window, lastSector - sector + 1);
+            if (count <= 0) break;
+
             source.ReadBlocks(sector, count, buffer, 0);
 
             for (int i = 0; i < count; i++)
-                if (MpegPsCarver.IsPackHeader(buffer, i * 2048)) { start = sector + i; break; }
-
-            if (start >= 0) break;
+                if (MpegPsCarver.IsPackHeader(buffer, i * 2048)) { foundAt = sector + i; break; }
         }
 
-        if (start < 0)
+        if (foundAt < 0)
         {
             log("Nessun video nei primi megabyte: passo alla ricerca completa.");
             return false;
+        }
+
+        // ritorno indietro per il punto esatto di inizio
+        start = foundAt;
+        long backFrom = Math.Max(firstSector, foundAt - probeStep);
+
+        for (long sector = backFrom; sector < foundAt; sector += window)
+        {
+            int count = (int)Math.Min(window, foundAt - sector);
+            if (count <= 0) break;
+
+            source.ReadBlocks(sector, count, buffer, 0);
+
+            bool found = false;
+            for (int i = 0; i < count; i++)
+                if (MpegPsCarver.IsPackHeader(buffer, i * 2048)) { start = sector + i; found = true; break; }
+
+            if (found) break;
         }
 
         // ultimo settore video, cercato a ritroso dalla fine dell'area scritta.

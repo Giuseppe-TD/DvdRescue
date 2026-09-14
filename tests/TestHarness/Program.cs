@@ -36,6 +36,7 @@ internal static class Program
         await TestSingleFileExtraction();
         await TestStreamingConversion();
         TestRawDisc();
+        TestVideoNotAtStart();
         TestReadVolume();
         TestQuickScan();
         await TestFileNames();
@@ -333,6 +334,36 @@ internal static class Program
         Check("il titolo copre tutta l'area video",
               quick.Titles.Count > 0 && quick.Titles[0].Bytes > 250L * 1024 * 1024,
               quick.Titles.Count > 0 ? quick.Titles[0].SizeText : "");
+    }
+
+    private static void TestVideoNotAtStart()
+    {
+        Section("Video che non comincia all'inizio del disco");
+
+        string path = Path.Combine(_media, "raw_offset.bin");
+        if (!File.Exists(path)) { Console.WriteLine("  (raw_offset.bin assente, salto)"); return; }
+
+        using var inner = new FileBlockSource(path);
+        using var counter = new CountingSource(inner);
+
+        var quick = RecoveryEngine.Analyze(counter, false, null, null, _ => { }, CancellationToken.None,
+                                           preciseSplit: false);
+
+        Console.WriteLine($"  lettura rapida: {quick.Titles.Count} titolo/i, " +
+                          $"{counter.BytesRead / 1048576.0:F1} MB letti, {counter.Operations} richieste");
+
+        Check("trova il video anche se parte a 60 MB dall'inizio", quick.Titles.Count == 1,
+              $"{quick.Titles.Count}");
+
+        if (quick.Titles.Count == 1)
+        {
+            long startMb = quick.Titles[0].Ranges[0].Offset / 1048576;
+            Console.WriteLine($"  inizio individuato a {startMb} MB");
+            Check("l'inizio è quello giusto", startMb >= 59 && startMb <= 61, $"{startMb} MB");
+        }
+
+        Check("e non legge tutto il disco per trovarlo", counter.BytesRead < inner.Length / 2,
+              $"{counter.BytesRead / 1048576.0:F1} MB su {inner.Length / 1048576.0:F1} MB");
     }
 
     private static void TestReadVolume()
