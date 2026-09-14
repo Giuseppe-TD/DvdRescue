@@ -32,7 +32,7 @@ jobs:
           dotnet-version: '8.0.x'
 
       - name: Strumenti di supporto
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ffmpeg genisoimage
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ffmpeg dvdauthor genisoimage
 
       - name: Genera le immagini di prova
         run: bash tests/TestHarness/make-test-images.sh
