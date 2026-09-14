@@ -1,75 +1,107 @@
 # DVDRescue
 
-Recupera i video dai DVD che Windows non riesce ad aprire — i dischetti da 8 cm delle
-videocamere miniDVD rimasti **non finalizzati**, i DVD-VR, le registrazioni interrotte a metà —
-e li esporta direttamente in **MP4**, senza passare per VOB, IFO o programmi di authoring.
+Recupera i video dai dischi che il computer non riesce ad aprire — i dischetti da 8 cm delle
+videocamere rimasti **non finalizzati**, i DVD-VR dei registratori, le riprese AVCHD, i Blu-ray
+registrati, le registrazioni interrotte a metà — e li consegna in **MP4**, pronti da guardare.
 
-È l'equivalente open della funzione di recupero di IsoBuster, ma specializzato su una cosa sola:
-tirare fuori il video e consegnarlo pronto da guardare.
+Niente VOB, niente IFO, niente authoring: si mette il disco, si preme un tasto, escono i video.
 
 ---
 
-## Come funziona
+## Cosa legge
 
-Un disco "non finalizzato" contiene i dati video, ma non la tabella dei contenuti: il filesystem
-e le strutture di navigazione vengono scritte solo alla chiusura del disco. Windows non trova
-nulla da montare e mostra un disco vuoto. I dati però ci sono.
+| Supporto | Formato | Come li trova |
+|---|---|---|
+| DVD-Video | `VIDEO_TS` con IFO | legge le IFO: titoli e capitoli veri |
+| DVD-VR | `DVD_RTAV/VR_MOVIE.VRO` | VR_MANGR.IFO, con ripiego sull'analisi del flusso |
+| DVD non finalizzato / +VR | VOB senza strutture | analisi diretta dei settori |
+| Blu-ray video | `BDMV` | playlist `.mpls` e clip `.m2ts` |
+| Blu-ray registrato | `BDAV` | playlist `.rpls`/`.vpls` |
+| AVCHD (videocamere) | `AVCHD/BDMV`, anche sotto `PRIVATE` | playlist, o direttamente i file `.MTS` |
+| Disco illeggibile | nessuna struttura | ricerca dei flussi MPEG nei settori |
 
-DVDRescue lavora sotto il livello del filesystem:
+Apre anche le immagini già riversate con altri programmi: **ISO, BIN/CUE, NRG, MDS/MDF,
+CCD/IMG, CDI, DAA** e i dump grezzi.
 
-1. **Interroga il lettore** con i comandi MMC (`READ DISC INFORMATION`, `READ TRACK INFORMATION`,
-   `READ DVD STRUCTURE`) per sapere se il disco è finalizzato e fin dove è stato scritto davvero.
-   Se il lettore mente o non risponde, cerca il limite reale con una ricerca binaria sui settori.
-2. **Copia l'area scritta in un'immagine grezza** (`.bin`), settore per settore, con ritentativi
-   progressivi: blocco grande → blocchi piccoli → singolo settore. I settori irrecuperabili
-   vengono azzerati e contati, senza interrompere il recupero. Il disco viene letto una volta sola:
-   tutto il resto del lavoro avviene sull'immagine.
-3. **Legge il filesystem se c'è**: parser UDF (ECMA-167) e ISO 9660 ridotti all'essenziale, per
-   trovare `VIDEO_TS/*.VOB`, `DVD_RTAV/VR_MOVIE.VRO` e le date di registrazione. Sui dischi VR
-   delle videocamere l'UDF viene aggiornato durante la ripresa, quindi spesso è leggibile anche
-   se il disco non è mai stato chiuso.
-4. **Cerca il video direttamente nei settori**, che è ciò che funziona sempre: su DVD ogni settore
-   da 2048 byte che contiene video inizia con un pack header MPEG-2 (`00 00 01 BA`). Dal pack
-   header si legge anche l'orologio di riferimento (SCR), che serve per calcolare la durata reale
-   e per capire dove finisce una registrazione e ne comincia un'altra.
-5. **Converte con ffmpeg**: H.264 + AAC per avere file che si aprono ovunque, oppure remux senza
-   ricodifica per tenere la qualità originale al 100%.
+---
+
+## Le tre cose che lo rendono usabile
+
+### Un file solo, non venti
+
+Se estrai un DVD con la sola ricerca dei flussi, l'orologio interno del video (SCR) riparte a
+ogni cella e a ogni capitolo: il risultato sono decine di frammenti da un filmato unico.
+DVDRescue legge invece le strutture che il disco dichiara — le IFO sui DVD, le playlist sui
+Blu-ray — che dicono esattamente dove comincia e dove finisce ogni registrazione.
+
+Poi lascia scegliere come dividere:
+
+- **Tutto in un unico file** (predefinito) — la ripresa di famiglia torna com'era
+- **Un file per registrazione** — utile quando sul disco ci sono riprese di giorni diversi
+- **Un file per capitolo** — quando il disco li dichiara
+
+### Lettura al volo
+
+Non copia prima tutto il disco su un'immagine: i byte vanno dal lettore direttamente a ffmpeg
+mentre il disco gira, senza file intermedi. Il disco viene letto **una volta sola**, e se chiedi
+sia l'MP4 ricodificato sia quello senza ricodifica escono entrambi da quella stessa lettura.
+
+La copia integrale del disco resta disponibile come opzione, per quando il supporto è messo male
+e conviene salvarlo prima di lavorarci sopra.
+
+### Legge dove gli altri si fermano
+
+Un disco "non finalizzato" contiene i dati ma non la tabella dei contenuti: il filesystem viene
+scritto solo alla chiusura del disco, quindi Windows non trova niente da montare. DVDRescue
+lavora sotto quel livello:
+
+1. Interroga il lettore con i comandi MMC (`READ DISC INFORMATION`, `READ TRACK INFORMATION`,
+   `READ DVD STRUCTURE`) per sapere fin dove il disco è stato scritto davvero; se il lettore non
+   risponde o mente, cerca il limite reale con una ricerca binaria sui settori.
+2. Se il volume non è accessibile, passa al device fisico del lettore.
+3. Legge l'UDF anche quando è parziale — sulle videocamere viene aggiornato durante la ripresa,
+   quindi spesso c'è anche a disco aperto — compresi i casi con VAT (scrittura a pacchetti),
+   sparing table (DVD-RAM/+RW) e partizione di metadati (UDF 2.50 dei Blu-ray).
+4. Legge a ritentativi progressivi: blocco grande → blocchi piccoli → settore singolo. I settori
+   irrecuperabili vengono contati e saltati, senza fermare il resto.
 
 ---
 
 ## Uso
 
 1. Scarica l'ultima release, scompatta, avvia `DVDRescue.exe` (chiede i permessi di
-   amministratore: servono per parlare con il lettore a livello di settore).
+   amministratore: servono per parlare col lettore a livello di settore).
 2. Inserisci il disco, scegli il lettore, premi **Leggi disco**.
-3. Al termine della scansione compare l'elenco dei video trovati con durata e dimensione.
-   Spunta quelli che ti interessano.
-4. Scegli cartella e formato di uscita, premi **Estrai e converti**.
+3. Compaiono i video trovati, con durata e provenienza (`IFO — titolo 2`, `playlist 00003.mpls`,
+   `scansione diretta`…). Spunta quelli che vuoi.
+4. Scegli come dividerli, la cartella di destinazione e il formato. Premi **Estrai e converti**.
 
-Il pulsante **Apri immagine...** riapre un `.bin` già creato (o un `.iso` fatto con altri
-programmi) e rifà l'analisi senza toccare il disco.
-
-### Formati di uscita
+**Formati di uscita**
 
 | Opzione | Risultato |
 |---|---|
-| **MP4 H.264 + AAC** | ricodifica con libx264, si apre su telefoni, TV, web. Lento ma universale. |
-| **MP4 senza ricodifica** | video MPEG-2 copiato tale e quale, audio convertito in AAC. Immediato, qualità intatta. |
-| **Tieni anche il .mpg grezzo** | lo stream estratto così com'è, utile come backup se qualcosa va storto. |
+| MP4 H.264 + AAC | ricodifica con libx264: si apre su telefoni, TV, web |
+| MP4 senza ricodifica | video copiato tale e quale, audio in AAC: immediato, qualità intatta |
+| Flusso grezzo | `.mpg` (DVD) o `.m2ts` (Blu-ray/AVCHD) così come sta sul disco |
 
-Il deinterlacciamento (`yadif`) è attivo di default: le videocamere registrano interlacciato e
-senza questo passaggio si vedono i pettini sui movimenti.
+Il deinterlacciamento è attivo di default: le videocamere registrano interlacciato e senza
+quel passaggio si vedono i pettini sui movimenti.
+
+Una nota sul flusso grezzo unito: mettendo in fila registrazioni diverse l'orologio MPEG riparte
+da capo, quindi il `.mpg` può dichiarare una durata più corta del vero. I dati ci sono tutti —
+l'MP4 convertito riporta la durata giusta.
 
 ---
 
 ## Se non trova niente
 
-- **Prova un altro lettore.** È il consiglio che risolve più spesso. Non tutti i masterizzatori
-  leggono i dischi 8 cm non finalizzati, e i DVD-RAM richiedono un drive compatibile.
-- **Rallenta la lettura.** Sui dischi rovinati aiuta molto (l'app usa `SET CD SPEED`).
+- **Prova un altro lettore.** È il consiglio che risolve più spesso: non tutti i masterizzatori
+  leggono i dischi da 8 cm non finalizzati, e i DVD-RAM richiedono un drive compatibile.
+- **Rallenta la lettura** (2x o 4x nella schermata): sui dischi rovinati recupera settori che a
+  piena velocità saltano.
+- **Spunta la scansione approfondita**: ignora le strutture e passa in rassegna tutti i settori.
+  Più lenta, ma è l'ultima spiaggia quando le IFO sono distrutte.
 - **Pulisci il disco** dal centro verso il bordo, in linea retta.
-- Se l'immagine viene creata ma non emergono titoli, riapri il `.bin`: l'analisi si ripete in
-  pochi secondi senza stressare ancora il disco.
 
 ---
 
@@ -84,8 +116,8 @@ dotnet publish src/DVDRescue/DVDRescue.csproj -c Release -r win-x64 --self-conta
 
 Metti `ffmpeg.exe` in `publish/ffmpeg/` oppure lascia che l'app lo scarichi al primo utilizzo.
 
-La build automatica è in `.github/workflows/build.yml`: parte a ogni push e, su un tag `v*`,
-pubblica la release con due pacchetti — uno con ffmpeg incluso e uno senza.
+La build automatica è in `.github/workflows/build.yml`: a ogni push esegue i test e, su un tag
+`v*`, pubblica la release con due pacchetti — uno con ffmpeg incluso e uno senza.
 
 ```bash
 git tag v1.0.0 && git push origin v1.0.0
@@ -95,17 +127,19 @@ git tag v1.0.0 && git push origin v1.0.0
 
 ## Test
 
-La logica di recupero ha un banco di prova che non richiede né lettore né dischi veri: genera
-due clip MPEG-2 in formato DVD, le impacchetta in tre immagini (un disco grezzo senza filesystem,
-un DVD-Video con UDF, un DVD-VR da videocamera) e verifica riconoscimento dei pack header,
-lettura dell'SCR, divisione in titoli, parsing UDF/ISO 9660, estrazione e conversione.
+Il motore di recupero ha un banco di prova che non richiede né lettore né dischi veri: autora
+due DVD-Video con `dvdauthor` (uno con tre titoli e capitoli, uno con un titolo composto da più
+celle), costruisce un disco grezzo senza filesystem, e verifica riconoscimento del disco, lettura
+delle IFO, numero di titoli, unione in un file solo, conversione al volo e robustezza sul rumore.
 
 ```bash
-bash tests/TestHarness/make-test-images.sh          # serve ffmpeg + genisoimage
+bash tests/TestHarness/make-test-images.sh      # serve ffmpeg, dvdauthor, genisoimage
 cd tests/TestHarness && dotnet run -c Release
 ```
 
-Gira anche in CI a ogni push (job `test` del workflow), prima della build di Windows.
+Il controllo che conta è il confronto fra i due criteri: sullo stesso disco le strutture danno
+**1 titolo** dove il vecchio taglio a ogni salto d'orologio ne produceva **4**. Su un disco vero
+con molti capitoli la differenza è fra un file e più di cento.
 
 ---
 
@@ -113,35 +147,38 @@ Gira anche in CI a ogni push (job `test` del workflow), prima della build di Win
 
 ```
 src/DVDRescue/
-├── Native/
-│   ├── NativeMethods.cs      P/Invoke: CreateFile, DeviceIoControl, SCSI_PASS_THROUGH_DIRECT
-│   ├── AlignedBuffer.cs      buffer allineato richiesto dall'IOCTL
-│   ├── OpticalDrive.cs       comandi MMC: READ(10), READ CD, DISC/TRACK INFORMATION, DVD STRUCTURE
-│   └── DriveEnumerator.cs    elenco lettori + INQUIRY
-├── Disc/
-│   ├── ISectorSource.cs      astrazione settori: lettore ottico o immagine, con ritentativi
-│   ├── DiscEngine.cs         limite dell'area scritta, immagine grezza, analisi, estrazione
-│   ├── UdfReader.cs          UDF/ECMA-167: anchor, partizione, fileset, file entry, extent
-│   └── Iso9660Reader.cs      ISO 9660 come ripiego
-├── Media/
-│   ├── MpegCarver.cs         pack header MPEG-2, SCR, divisione in titoli
-│   ├── FfmpegRunner.cs       conversione e avanzamento
-│   └── FfmpegLocator.cs      ricerca e download automatico di ffmpeg
-└── MainForm.cs               interfaccia
+├── Core/             astrazione dei blocchi (lettore, immagine, partizione) e utilità
+├── Native/           SCSI pass-through, comandi MMC, elenco lettori
+├── FileSystems/      UDF (VAT, sparing, metadati 2.50) e ISO 9660 + Joliet + Rock Ridge
+├── Dvd/              IFO DVD-Video (titoli, capitoli, celle) e DVD-VR
+├── Bluray/           playlist BDMV/BDAV/AVCHD e analisi Transport Stream
+├── Images/           ISO, BIN/CUE, NRG, MDS/MDF, CCD, CDI, DAA
+├── Media/            ricerca dei flussi MPEG, ffmpeg
+├── Recovery/         motore: riconoscimento disco, titoli, estrazione al volo
+└── MainForm.cs       interfaccia
 
-tests/TestHarness/            banco di prova su immagini sintetiche
-.github/workflows/build.yml   test su Linux + build Windows + release automatica
+tests/TestHarness/    banco di prova su DVD autorati
+extra/                driver non usati da questo programma (vedi extra/README.md)
 ```
 
 ---
 
-## Limiti noti
+## Limiti noti, detti chiaramente
 
-- Solo Windows x64: l'accesso al lettore passa per le API SCSI di Windows.
-- I dischi **cifrati** (CSS) non sono gestiti: riguardano i film commerciali, non le registrazioni
-  casalinghe, che è il caso d'uso di questo programma.
-- I capitoli interni a una registrazione non vengono ricostruiti: la divisione in titoli segue le
-  interruzioni di registrazione, che è quello che serve nella pratica.
+- **Solo Windows x64**: l'accesso al lettore passa per le API SCSI di Windows.
+- **Niente dischi protetti**: CSS sui DVD e AACS sui Blu-ray non vengono aggirati. Riguardano i
+  film commerciali, non le registrazioni casalinghe, che sono il motivo per cui esiste questo
+  programma.
+- **DVD-VR**: il parser delle strutture VR è scritto sulla descrizione pubblica disponibile e
+  **non è mai stato provato su un disco reale**. Quando i controlli di coerenza non passano, il
+  programma lo dice e ripiega sull'analisi diretta del VRO, che funziona comunque.
+- **Blu-ray e AVCHD**: playlist e clip info sono verificate contro materiale generato qui, non
+  contro dischi commerciali. Il percorso che funziona sempre — l'elenco dei file `.m2ts`/`.MTS` —
+  è quello usato quando le playlist mancano.
+- **CDI e DAA**: formati proprietari non documentati ufficialmente. Sono letti per quanto è
+  ricostruibile, con controlli che fanno fallire l'apertura invece di restituire dati sbagliati.
+  I DAA cifrati o divisi in più parti vengono rifiutati con un messaggio esplicito.
+- **Nessuna correzione EDC/ECC**: i settori danneggiati vengono letti così come sono, non riparati.
 
 ## Licenza
 

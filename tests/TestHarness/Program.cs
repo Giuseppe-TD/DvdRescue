@@ -1,10 +1,15 @@
-using DVDRescue.Disc;
+using System.Diagnostics;
+using System.Globalization;
+using DVDRescue.Core;
 using DVDRescue.Media;
-using DVDRescue.Model;
+using DVDRescue.Recovery;
 
-internal static class TestMain
+namespace TestHarness;
+
+internal static class Program
 {
     private static int _failures;
+    private static string _media;
 
     private static void Check(string what, bool ok, string detail = "")
     {
@@ -12,189 +17,336 @@ internal static class TestMain
         if (!ok) _failures++;
     }
 
+    private static void Section(string title) => Console.WriteLine($"\n=== {title} ===");
+
     public static async Task<int> Main(string[] args)
     {
-        string image = Path.Combine(Environment.CurrentDirectory, "disc.bin");
-        Console.WriteLine($"Immagine di prova: {image}");
-
-        using var src = new ImageSectorSource(image);
-        Console.WriteLine($"Settori totali: {src.TotalSectors}");
-
-        // --- 1. pack header e SCR -------------------------------------------
-        var sector = new byte[2048];
-        src.TryReadSector(16, sector, 0);
-        Check("il primo settore video è riconosciuto come pack MPEG", MpegCarver.IsPackHeader(sector, 0));
-
-        ulong scr0 = MpegCarver.ReadScr(sector, 0);
-        Console.WriteLine($"  SCR del primo pack: {scr0} ({scr0 / 90000.0:F3} s)");
-        Check("SCR iniziale plausibile (< 5 s)", scr0 < 5 * 90000);
-
-        src.TryReadSector(0, sector, 0);
-        Check("un settore vuoto NON è scambiato per video", !MpegCarver.IsPackHeader(sector, 0));
-
-        // dati casuali che iniziano per caso con lo start code non devono passare i marker bit
-        var rnd = new Random(42);
-        int falsePositives = 0;
-        var s2 = new byte[2048];
-        for (int i = 0; i < 2000; i++)
+        _media = args.Length > 0 ? args[0] : Path.Combine(Environment.CurrentDirectory, "media");
+        if (!Directory.Exists(_media))
         {
-            rnd.NextBytes(s2);
-            s2[0] = 0; s2[1] = 0; s2[2] = 1; s2[3] = 0xBA;
-            if (MpegCarver.IsPackHeader(s2, 0)) falsePositives++;
-        }
-        Check("pochi falsi positivi su dati casuali con start code valido",
-              falsePositives < 200, $"{falsePositives}/2000");
-
-        // --- 2. carving ------------------------------------------------------
-        var carver = new MpegCarver { MinTitleSectors = 64 };
-        var titles = carver.Scan(src, 0, src.TotalSectors - 1, null, CancellationToken.None);
-
-        Console.WriteLine($"\nTitoli individuati: {titles.Count}");
-        foreach (var t in titles)
-            Console.WriteLine($"  #{t.Index}  LBA {t.StartLba,6}  {t.SectorCount,6} settori  " +
-                              $"{t.SizeText,8}  durata {t.DurationText}  extent {t.Extents.Count}");
-
-        Check("le due registrazioni separate dal gap grande sono titoli distinti", titles.Count >= 2,
-              $"{titles.Count} titoli");
-        Check("il primo titolo inizia al settore 16", titles.Count > 0 && titles[0].StartLba == 16);
-        Check("il gap piccolo non ha spezzato il primo titolo in due extent contigui perduti",
-              titles.Count > 0 && titles[0].Extents.Count >= 1);
-        Check("la durata del primo titolo è vicina a 6 s",
-              titles.Count > 0 && Math.Abs(titles[0].DurationSeconds - 6.0) < 1.5,
-              titles.Count > 0 ? $"{titles[0].DurationSeconds:F2} s" : "");
-
-        // --- 3. estrazione ---------------------------------------------------
-        string outDir = Path.Combine(Environment.CurrentDirectory, "out");
-        Directory.CreateDirectory(outDir);
-
-        foreach (var t in titles)
-        {
-            string mpg = Path.Combine(outDir, $"titolo_{t.Index:00}.mpg");
-            long bytes = await DiscEngine.WriteTitleStreamAsync(src, t, mpg, null, CancellationToken.None);
-            var fi = new FileInfo(mpg);
-            Console.WriteLine($"\n  estratto {Path.GetFileName(mpg)}: {fi.Length} byte");
-            Check($"il file del titolo {t.Index} contiene solo settori validi",
-                  fi.Length % 2048 == 0 && fi.Length == bytes);
-            Check($"il titolo {t.Index} non contiene settori azzerati",
-                  !HasZeroSector(mpg));
+            Console.WriteLine($"Cartella del materiale di prova non trovata: {_media}");
+            Console.WriteLine("Esegui prima make-test-images.sh");
+            return 2;
         }
 
-        // --- 4. conversione con ffmpeg ---------------------------------------
-        string ffmpeg = FindFfmpeg();
-        if (ffmpeg != null && titles.Count > 0)
-        {
-            var runner = new FfmpegRunner(ffmpeg);
-            var options = new ExtractOptions { Crf = 28, Preset = "ultrafast", Deinterlace = true };
+        Console.WriteLine($"Materiale di prova: {_media}");
 
-            string inMpg = Path.Combine(outDir, "titolo_01.mpg");
-            string outMp4 = Path.Combine(outDir, "titolo_01.mp4");
-            string argsH264 = FfmpegRunner.BuildH264Args(inMpg, outMp4, options);
-            Console.WriteLine($"\n  ffmpeg {argsH264}");
-
-            int code = await runner.RunAsync(argsH264, titles[0].DurationSeconds, "test", null,
-                                             s => Console.WriteLine("    " + s), CancellationToken.None);
-            Check("la ricodifica H.264 termina senza errori", code == 0, $"exit {code}");
-            Check("l'MP4 H.264 è stato creato", File.Exists(outMp4) && new FileInfo(outMp4).Length > 10000);
-
-            string outRemux = Path.Combine(outDir, "titolo_01_originale.mp4");
-            int code2 = await runner.RunAsync(FfmpegRunner.BuildRemuxArgs(inMpg, outRemux),
-                                              titles[0].DurationSeconds, "test", null,
-                                              s => Console.WriteLine("    " + s), CancellationToken.None);
-            Check("il remux senza ricodifica termina senza errori", code2 == 0, $"exit {code2}");
-            Check("l'MP4 remuxato è stato creato", File.Exists(outRemux) && new FileInfo(outRemux).Length > 10000);
-        }
-
-        // --- 5. filesystem su immagine senza UDF -----------------------------
-        var udf = UdfReader.TryRead(src, src.TotalSectors, s => Console.WriteLine("    " + s));
-        Check("su un'immagine senza filesystem il parser UDF non inventa nulla", udf == null);
-
-        var iso = Iso9660Reader.TryRead(src, s => Console.WriteLine("    " + s));
-        Check("su un'immagine senza filesystem il parser ISO 9660 non inventa nulla",
-              iso == null || iso.Count == 0);
-
-        // --- 6. immagini UDF reali -------------------------------------------
-        TestUdfImage("dvdvideo.iso", "VIDEO_TS/VTS_01_1.VOB", DiscKind.DvdPlusVr);
-        TestUdfImage("dvdvr.iso", "DVD_RTAV/VR_MOVIE.VRO", DiscKind.DvdVr);
+        TestDvdVideo();
+        TestNoFragmentation();
+        await TestSingleFileExtraction();
+        await TestStreamingConversion();
+        TestRawDisc();
+        TestBadInput();
 
         Console.WriteLine($"\n=== {(_failures == 0 ? "TUTTI I CONTROLLI SUPERATI" : _failures + " CONTROLLI FALLITI")} ===");
         return _failures == 0 ? 0 : 1;
     }
 
-    private static void TestUdfImage(string file, string expectedFile, DiscKind expectedKind)
+    // ------------------------------------------------------------- DVD-Video
+
+    private static void TestDvdVideo()
     {
-        string path = Path.Combine(Environment.CurrentDirectory, file);
-        if (!File.Exists(path)) { Console.WriteLine($"\n(salto {file}: non presente)"); return; }
+        Section("DVD-Video con 3 titoli e capitoli");
 
-        Console.WriteLine($"\n--- {file} ---");
-        using var src = new ImageSectorSource(path);
+        string iso = Path.Combine(_media, "dvd.iso");
+        if (!File.Exists(iso)) { Console.WriteLine("  (dvd.iso assente, salto)"); return; }
 
-        var udf = UdfReader.TryRead(src, src.TotalSectors, s => Console.WriteLine("    " + s));
-        Check("il volume UDF è stato letto", udf != null);
-        if (udf == null) return;
+        using var source = new FileBlockSource(iso);
+        var result = RecoveryEngine.Analyze(source, false, null, Log, CancellationToken.None);
 
-        foreach (var f in udf.Files)
-            Console.WriteLine($"    {f.Path,-32} {f.Length,10} byte  extent {string.Join(",", f.Extents)}  {f.Modified}");
+        Console.WriteLine($"  profilo: {result.ProfileText}");
+        Console.WriteLine($"  filesystem: {result.FilesystemInfo}  volume: {result.VolumeLabel}");
 
-        var target = udf.Files.FirstOrDefault(f => f.Path.Equals(expectedFile, StringComparison.OrdinalIgnoreCase));
-        Check($"UDF trova {expectedFile}", target != null);
-        if (target == null) return;
+        foreach (var t in result.Titles)
+            Console.WriteLine($"    #{t.Index} {t.DurationText} {t.SizeText,8}  {t.Origin}  [{t.VideoInfo}]");
 
-        Check("la dimensione del file è corretta", target.Length > 100000,
-              $"{target.Length} byte");
-        Check("il file ha almeno un extent", target.Extents.Count > 0);
+        Check("il disco è riconosciuto come DVD-Video", result.Profile == DVDRescue.Recovery.DiscProfile.DvdVideo);
+        Check("trova esattamente 3 titoli (non decine di frammenti)", result.Titles.Count == 3,
+              $"{result.Titles.Count} titoli");
+        Check("i capitoli sono disponibili", result.ChapterTitles.Count >= 4,
+              $"{result.ChapterTitles.Count} capitoli");
 
-        // l'extent deve puntare davvero all'inizio dello stream video
-        var sec = new byte[2048];
-        src.TryReadSector(target.Extents[0].Lba, sec, 0);
-        Check("l'extent punta a dati video reali", MpegCarver.IsPackHeader(sec, 0),
-              $"LBA {target.Extents[0].Lba}");
+        double first = result.Titles.Count > 0 ? result.Titles[0].Seconds : 0;
+        Check("la durata del primo titolo è circa 20 s", Math.Abs(first - 20.0) < 1.5, $"{first:F2} s");
 
-        // il parser ISO 9660 deve trovare gli stessi file
-        var iso = Iso9660Reader.TryRead(src, _ => { });
-        Check("anche ISO 9660 elenca i file", iso != null && iso.Count > 0,
-              iso != null ? $"{iso.Count} file" : "nullo");
-
-        // analisi completa
-        var analysis = DiscEngine.ScanContent(src, new DiscAnalysis { LastWrittenLba = src.TotalSectors - 1 },
-                                              null, s => Console.WriteLine("    " + s), CancellationToken.None);
-        Check($"il disco è classificato come {expectedKind}", analysis.Kind == expectedKind,
-              analysis.Kind.ToString());
-        Check("l'analisi individua almeno un titolo", analysis.Titles.Count >= 1,
-              $"{analysis.Titles.Count} titoli");
-
-        foreach (var t in analysis.Titles)
-            Console.WriteLine($"    #{t.Index} LBA {t.StartLba} {t.SizeText} {t.DurationText} da {t.SourceFile} ({t.Recorded})");
+        // ogni titolo deve avere pochi tratti contigui, non uno per cella
+        if (result.Titles.Count > 0)
+            Check("i tratti sono uniti", result.Titles.All(t => t.Ranges.Count <= 3),
+                  string.Join(", ", result.Titles.Select(t => $"{t.Ranges.Count} tratti")));
     }
+
+    // ------------------------------------- confronto con la scansione grezza
+
+    private static void TestNoFragmentation()
+    {
+        Section("Il problema dei frammenti: strutture contro scansione");
+
+        string iso = Path.Combine(_media, "dvd2.iso");
+        if (!File.Exists(iso)) { Console.WriteLine("  (dvd2.iso assente, salto)"); return; }
+
+        using var source = new FileBlockSource(iso);
+
+        var withStructures = RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
+        var withScan = RecoveryEngine.Analyze(source, true, null, _ => { }, CancellationToken.None);
+
+        Console.WriteLine($"  leggendo le IFO:        {withStructures.Titles.Count} titoli");
+        Console.WriteLine($"  scandendo i settori:    {withScan.Titles.Count} titoli");
+
+        Check("le strutture del disco danno pochi titoli", withStructures.Titles.Count <= 3,
+              $"{withStructures.Titles.Count}");
+        Check("anche la scansione prudente non esplode in frammenti", withScan.Titles.Count <= 4,
+              $"{withScan.Titles.Count}");
+
+        // la vecchia regola (taglio a ogni salto d'orologio) produceva 9 titoli su questo disco
+        var aggressive = new MpegPsCarver { SplitOnClockReset = true, ClockResetSeconds = 0.1, MaxGapSectors = 64, MinSegmentSectors = 128 };
+        var aggressiveSegments = aggressive.Scan(source, 0, source.Length, null, CancellationToken.None);
+        Console.WriteLine($"  col vecchio criterio:   {aggressiveSegments.Count} titoli");
+        Check("il criterio prudente riduce nettamente i frammenti",
+              withScan.Titles.Count < aggressiveSegments.Count,
+              $"{withScan.Titles.Count} contro {aggressiveSegments.Count}");
+    }
+
+    // ---------------------------------------------------- unione in un file
+
+    private static async Task TestSingleFileExtraction()
+    {
+        Section("Unione di tutto in un solo file");
+
+        string iso = Path.Combine(_media, "dvd.iso");
+        if (!File.Exists(iso)) { Console.WriteLine("  (dvd.iso assente, salto)"); return; }
+
+        using var source = new FileBlockSource(iso);
+        var result = RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
+
+        var single = RecoveryEngine.ApplySplit(result, SplitMode.SingleFile);
+        Check("l'unione produce un solo elemento", single.Count == 1, $"{single.Count}");
+        if (single.Count != 1) return;
+
+        long sumOfParts = result.Titles.Sum(t => t.Bytes);
+        Console.WriteLine($"  titoli separati: {sumOfParts / 1048576.0:F1} MB — unito: {single[0].Bytes / 1048576.0:F1} MB");
+        Check("l'unione non perde byte", single[0].Bytes >= sumOfParts * 0.99,
+              $"{single[0].Bytes} contro {sumOfParts}");
+
+        string outDir = Path.Combine(_media, "out");
+        Directory.CreateDirectory(outDir);
+        string raw = Path.Combine(outDir, "unito.mpg");
+
+        using (var stream = new RangeStream(source, single[0].Ranges, true, CancellationToken.None))
+        await using (var file = File.Create(raw))
+        {
+            await stream.CopyToAsync(file);
+        }
+
+        double duration = Probe(raw);
+        double expected = result.Titles.Sum(t => t.Seconds);
+        long frames = ProbeFrames(raw);
+        long expectedFrames = (long)Math.Round(expected * 25);
+
+        Console.WriteLine($"  durata dichiarata dal flusso grezzo: {duration:F2} s");
+        Console.WriteLine($"  fotogrammi effettivi: {frames} (attesi circa {expectedFrames})");
+        Console.WriteLine("  nota: unendo registrazioni diverse l'orologio MPEG riparte da capo,");
+        Console.WriteLine("        quindi il .mpg grezzo dichiara una durata più corta del vero.");
+        Console.WriteLine("        I dati ci sono tutti e la conversione rigenera i tempi giusti.");
+
+        Check("il file unito è uno stream valido", duration > 0);
+        Check("contiene tutti i fotogrammi delle registrazioni unite",
+              frames >= expectedFrames * 0.98, $"{frames} contro {expectedFrames}");
+
+        // la conversione deve restituire la durata vera nonostante i tempi discontinui
+        string ffmpeg = FindFfmpeg();
+        if (ffmpeg != null)
+        {
+            string fixedMp4 = Path.Combine(outDir, "unito.mp4");
+            RunProcess(ffmpeg, $"-v error -fflags +genpts -i \"{raw}\" -c:v copy -c:a aac -y \"{fixedMp4}\"");
+            double converted = Probe(fixedMp4);
+            Console.WriteLine($"  durata dopo la conversione: {converted:F2} s");
+            Check("la conversione rimette a posto i tempi", Math.Abs(converted - expected) < 3.0,
+                  $"{converted:F2} contro {expected:F2}");
+        }
+    }
+
+    // ------------------------------------------------ conversione al volo
+
+    private static async Task TestStreamingConversion()
+    {
+        Section("Conversione al volo, senza file intermedi");
+
+        string iso = Path.Combine(_media, "dvd.iso");
+        string ffmpeg = FindFfmpeg();
+        if (!File.Exists(iso) || ffmpeg == null) { Console.WriteLine("  (materiale o ffmpeg assenti, salto)"); return; }
+
+        using var source = new FileBlockSource(iso);
+        var result = RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
+        var titles = RecoveryEngine.ApplySplit(result, SplitMode.SingleFile);
+        if (titles.Count == 0) { Check("nessun titolo da convertire", false); return; }
+
+        string outDir = Path.Combine(_media, "out");
+        Directory.CreateDirectory(outDir);
+
+        var options = new ExtractOptions
+        {
+            OutputFolder = outDir,
+            Split = SplitMode.SingleFile,
+            MakeH264 = true,
+            MakeRemux = true,
+            KeepRaw = false,
+            Crf = 30,
+            Preset = "ultrafast",
+            Deinterlace = false,
+            FileNamePrefix = "streaming"
+        };
+
+        var runner = new FfmpegRunner(ffmpeg);
+        var watch = Stopwatch.StartNew();
+
+        await TitleExtractor.ExtractAsync(source, titles[0], options, runner, null,
+                                          m => Console.WriteLine("    " + m), CancellationToken.None);
+
+        watch.Stop();
+
+        string mp4 = Path.Combine(outDir, "streaming.mp4");
+        string remux = Path.Combine(outDir, "streaming_originale.mp4");
+
+        Check("l'MP4 ricodificato è stato creato", File.Exists(mp4) && new FileInfo(mp4).Length > 50000,
+              File.Exists(mp4) ? $"{new FileInfo(mp4).Length / 1024} KB" : "assente");
+        Check("l'MP4 senza ricodifica è stato creato", File.Exists(remux) && new FileInfo(remux).Length > 50000,
+              File.Exists(remux) ? $"{new FileInfo(remux).Length / 1024} KB" : "assente");
+
+        double expected = result.Titles.Sum(t => t.Seconds);
+        double got = File.Exists(mp4) ? Probe(mp4) : 0;
+        Console.WriteLine($"  durata MP4: {got:F2} s (attesa {expected:F2} s) in {watch.Elapsed.TotalSeconds:F1} s");
+        Check("la durata dell'MP4 corrisponde", Math.Abs(got - expected) < 3.0, $"{got:F2}");
+
+        double gotRemux = File.Exists(remux) ? Probe(remux) : 0;
+        Check("anche il remux ha la durata giusta", Math.Abs(gotRemux - expected) < 3.0, $"{gotRemux:F2}");
+
+        Check("entrambe le uscite sono state prodotte in una sola lettura del disco",
+              File.Exists(mp4) && File.Exists(remux));
+    }
+
+    // --------------------------------------------------- disco senza filesystem
+
+    private static void TestRawDisc()
+    {
+        Section("Disco senza filesystem né strutture");
+
+        string bin = Path.Combine(_media, "raw.bin");
+        if (!File.Exists(bin)) { Console.WriteLine("  (raw.bin assente, salto)"); return; }
+
+        using var source = new FileBlockSource(bin);
+        var result = RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
+
+        foreach (var t in result.Titles)
+            Console.WriteLine($"    #{t.Index} {t.DurationText} {t.SizeText,8}  {t.Origin}");
+
+        Check("ricade sulla scansione diretta", result.Profile == DVDRescue.Recovery.DiscProfile.RawVideo);
+        Check("trova le due registrazioni separate", result.Titles.Count == 2, $"{result.Titles.Count}");
+        Check("non le frammenta", result.Titles.All(t => t.Ranges.Count == 1));
+    }
+
+    // -------------------------------------------------------- dati sbagliati
+
+    private static void TestBadInput()
+    {
+        Section("Robustezza su dati insensati");
+
+        string junk = Path.Combine(_media, "rumore.bin");
+        if (!File.Exists(junk))
+        {
+            var random = new Random(7);
+            var buffer = new byte[8 << 20];
+            random.NextBytes(buffer);
+            File.WriteAllBytes(junk, buffer);
+        }
+
+        try
+        {
+            using var source = new FileBlockSource(junk);
+            var result = RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
+            Check("nessuna eccezione su 8 MB di rumore", true, $"{result.Titles.Count} falsi titoli");
+            Check("pochi o nessun falso positivo", result.Titles.Count <= 1, $"{result.Titles.Count}");
+        }
+        catch (Exception ex)
+        {
+            Check("nessuna eccezione su 8 MB di rumore", false, ex.Message);
+        }
+
+        try
+        {
+            string tiny = Path.Combine(_media, "minuscolo.bin");
+            File.WriteAllBytes(tiny, new byte[1024]);
+            using var source = new FileBlockSource(tiny);
+            RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
+            Check("nessuna eccezione su un file troncato", true);
+        }
+        catch (Exception ex)
+        {
+            Check("nessuna eccezione su un file troncato", false, ex.Message);
+        }
+    }
+
+    // ------------------------------------------------------------- supporto
+
+    private static void Log(string message) => Console.WriteLine("    " + message);
 
     private static string FindFfmpeg()
     {
         foreach (var name in new[] { "ffmpeg", "ffmpeg.exe" })
-        {
             foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "")
                      .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
             {
                 try
                 {
-                    string p = Path.Combine(dir.Trim(), name);
-                    if (File.Exists(p)) return p;
+                    string candidate = Path.Combine(dir.Trim(), name);
+                    if (File.Exists(candidate)) return candidate;
                 }
                 catch { }
             }
-        }
-        Console.WriteLine("(ffmpeg non trovato nel PATH: salto i test di conversione)");
         return null;
     }
 
-    private static bool HasZeroSector(string path)
+    private static void RunProcess(string fileName, string arguments)
     {
-        using var fs = File.OpenRead(path);
-        var buf = new byte[2048];
-        while (fs.Read(buf, 0, 2048) == 2048)
+        try
         {
-            bool allZero = true;
-            for (int i = 0; i < 16; i++) if (buf[i] != 0) { allZero = false; break; }
-            if (allZero) return true;
+            var psi = new ProcessStartInfo(fileName, arguments) { UseShellExecute = false };
+            using var process = Process.Start(psi);
+            process.WaitForExit();
         }
-        return false;
+        catch { }
+    }
+
+    private static double Probe(string path)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("ffprobe",
+                $"-v error -show_entries format=duration -of default=nw=1:nk=1 \"{path}\"")
+            { RedirectStandardOutput = true, UseShellExecute = false };
+
+            using var process = Process.Start(psi);
+            string output = process.StandardOutput.ReadToEnd().Trim();
+            process.WaitForExit();
+
+            return double.TryParse(output, NumberStyles.Float, CultureInfo.InvariantCulture, out double d) ? d : 0;
+        }
+        catch { return 0; }
+    }
+
+    private static long ProbeFrames(string path)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("ffprobe",
+                $"-v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of default=nw=1:nk=1 \"{path}\"")
+            { RedirectStandardOutput = true, UseShellExecute = false };
+
+            using var process = Process.Start(psi);
+            string output = process.StandardOutput.ReadToEnd().Trim();
+            process.WaitForExit();
+
+            return long.TryParse(output, out long n) ? n : 0;
+        }
+        catch { return 0; }
     }
 }

@@ -1,19 +1,20 @@
 using System.Collections.Concurrent;
 using System.Reflection;
-using DVDRescue.Disc;
+using DVDRescue.Core;
+using DVDRescue.Images;
 using DVDRescue.Media;
-using DVDRescue.Model;
 using DVDRescue.Native;
+using DVDRescue.Recovery;
 
 namespace DVDRescue;
 
 public partial class MainForm : Form
 {
     private CancellationTokenSource _cts;
-    private ISectorSource _source;
+    private IBlockSource _source;
     private OpticalDrive _drive;
-    private DiscAnalysis _analysis;
-    private string _imagePath;
+    private DiscImage _image;
+    private RecoveryResult _result;
     private string _ffmpegPath;
     private bool _busy;
 
@@ -36,42 +37,48 @@ public partial class MainForm : Form
             using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("DVDRescue.app.ico");
             if (stream != null) Icon = new Icon(stream);
         }
-        catch { /* icona non critica */ }
+        catch { /* l'icona non è critica */ }
     }
 
     // --------------------------------------------------------------- ciclo UI
 
     private void MainForm_Load(object sender, EventArgs e)
     {
-        string docs = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
-        if (string.IsNullOrEmpty(docs)) docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        string videos = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
+        if (string.IsNullOrEmpty(videos)) videos = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
 
-        txtWorkFolder.Text = Path.Combine(docs, "DVDRescue", "lavoro");
-        txtOutFolder.Text = Path.Combine(docs, "DVDRescue");
+        txtOutFolder.Text = Path.Combine(videos, "DVDRescue");
+        txtWorkFolder.Text = Path.Combine(videos, "DVDRescue", "immagini");
 
         RefreshDrives();
 
         _ffmpegPath = FfmpegLocator.Find();
         Log(_ffmpegPath != null
-            ? $"ffmpeg trovato: {_ffmpegPath}"
-            : "ffmpeg non trovato: verrà scaricato automaticamente alla prima conversione.");
+            ? $"ffmpeg: {_ffmpegPath}"
+            : "ffmpeg non trovato: verrà scaricato alla prima conversione.");
 
-        Log("Inserisci il disco e premi \"Leggi disco\". Per i dischi rovinati conviene lasciare attiva la copia su immagine.");
+        Log("Inserisci il disco e premi \"Leggi disco\".");
     }
 
     private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
     {
         if (_busy)
         {
-            var r = MessageBox.Show("Un'operazione è in corso. Vuoi interromperla e uscire?",
+            var answer = MessageBox.Show("Un'operazione è in corso. Interrompere e uscire?",
                 "DVDRescue", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-            if (r != DialogResult.Yes) { e.Cancel = true; return; }
+            if (answer != DialogResult.Yes) { e.Cancel = true; return; }
             _cts?.Cancel();
         }
 
         _uiTimer.Stop();
-        _source?.Dispose();
-        _drive?.Dispose();
+        ReleaseSource();
+    }
+
+    private void ReleaseSource()
+    {
+        _source?.Dispose(); _source = null;
+        _image?.Dispose(); _image = null;
+        _drive?.Dispose(); _drive = null;
     }
 
     private void UiTimer_Tick(object sender, EventArgs e)
@@ -81,19 +88,16 @@ public partial class MainForm : Form
             var sb = new System.Text.StringBuilder();
             while (_logQueue.TryDequeue(out string line))
                 sb.AppendLine($"[{DateTime.Now:HH:mm:ss}] {line}");
-
             txtLog.AppendText(sb.ToString());
         }
 
-        var p = _lastProgress;
-        if (p != null)
+        var progress = _lastProgress;
+        if (progress != null)
         {
             _lastProgress = null;
-            int value = (int)Math.Max(0, Math.Min(100, p.Percent));
+            int value = (int)Math.Max(0, Math.Min(100, progress.Percent));
             if (progressBar.Value != value) progressBar.Value = value;
-
-            string speed = p.SpeedMbPerSec > 0.1 ? $"  —  {p.SpeedMbPerSec:F1} MB/s" : "";
-            lblStatus.Text = $"{p.Stage}: {p.Detail}  ({value}%){speed}";
+            lblStatus.Text = $"{progress.Stage}: {progress.Detail}  ({value}%)";
         }
     }
 
@@ -101,6 +105,9 @@ public partial class MainForm : Form
 
     private IProgress<ProgressReport> CreateProgress() =>
         new Progress<ProgressReport>(p => _lastProgress = p);
+
+    private IProgress<string> CreateTextProgress() =>
+        new Progress<string>(s => _lastProgress = new ProgressReport { Stage = "Analisi", Detail = s });
 
     private void SetBusy(bool busy)
     {
@@ -111,7 +118,6 @@ public partial class MainForm : Form
         cmbDrives.Enabled = !busy;
         btnExtract.Enabled = !busy && lstTitles.Items.Count > 0;
         btnCancel.Enabled = busy;
-        grpOutput.Enabled = true;
         Cursor = busy ? Cursors.AppStarting : Cursors.Default;
     }
 
@@ -120,15 +126,14 @@ public partial class MainForm : Form
         foreach (ListViewItem item in lstTitles.Items) item.Checked = value;
     }
 
-    // ------------------------------------------------------------- sorgente
+    // -------------------------------------------------------------- sorgente
 
     private void RefreshDrives()
     {
         cmbDrives.Items.Clear();
         try
         {
-            var drives = DriveEnumerator.List();
-            foreach (var d in drives) cmbDrives.Items.Add(d);
+            foreach (var drive in DriveEnumerator.List()) cmbDrives.Items.Add(drive);
             if (cmbDrives.Items.Count > 0) cmbDrives.SelectedIndex = 0;
             else Log("Nessun lettore ottico rilevato.");
         }
@@ -142,28 +147,29 @@ public partial class MainForm : Form
 
     private void BtnBrowseWork_Click(object sender, EventArgs e)
     {
-        using var dlg = new FolderBrowserDialog { Description = "Cartella di lavoro per l'immagine del disco" };
-        if (Directory.Exists(txtWorkFolder.Text)) dlg.SelectedPath = txtWorkFolder.Text;
-        if (dlg.ShowDialog(this) == DialogResult.OK) txtWorkFolder.Text = dlg.SelectedPath;
+        using var dialog = new FolderBrowserDialog { Description = "Dove salvare la copia del disco" };
+        if (Directory.Exists(txtWorkFolder.Text)) dialog.SelectedPath = txtWorkFolder.Text;
+        if (dialog.ShowDialog(this) == DialogResult.OK) txtWorkFolder.Text = dialog.SelectedPath;
     }
 
     private void BtnBrowseOut_Click(object sender, EventArgs e)
     {
-        using var dlg = new FolderBrowserDialog { Description = "Cartella di destinazione dei video" };
-        if (Directory.Exists(txtOutFolder.Text)) dlg.SelectedPath = txtOutFolder.Text;
-        if (dlg.ShowDialog(this) == DialogResult.OK) txtOutFolder.Text = dlg.SelectedPath;
+        using var dialog = new FolderBrowserDialog { Description = "Dove salvare i video" };
+        if (Directory.Exists(txtOutFolder.Text)) dialog.SelectedPath = txtOutFolder.Text;
+        if (dialog.ShowDialog(this) == DialogResult.OK) txtOutFolder.Text = dialog.SelectedPath;
     }
 
     private async void BtnOpenImage_Click(object sender, EventArgs e)
     {
-        using var dlg = new OpenFileDialog
+        using var dialog = new OpenFileDialog
         {
-            Title = "Apri un'immagine grezza del disco",
-            Filter = "Immagini disco (*.bin;*.iso;*.img;*.raw)|*.bin;*.iso;*.img;*.raw|Tutti i file (*.*)|*.*"
+            Title = "Apri un'immagine di disco",
+            Filter = "Immagini disco (*.iso;*.bin;*.img;*.nrg;*.mds;*.ccd;*.cdi;*.daa;*.cue;*.raw)" +
+                     "|*.iso;*.bin;*.img;*.nrg;*.mds;*.ccd;*.cdi;*.daa;*.cue;*.raw|Tutti i file (*.*)|*.*"
         };
 
-        if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        await RunAnalysisAsync(dlg.FileName);
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        await RunAnalysisAsync(dialog.FileName);
     }
 
     private async void BtnRead_Click(object sender, EventArgs e) => await RunAnalysisAsync(null);
@@ -174,7 +180,12 @@ public partial class MainForm : Form
         Log("Interruzione richiesta...");
     }
 
-    // -------------------------------------------------------------- analisi
+    private void CmbSplit_SelectedIndexChanged(object sender, EventArgs e)
+    {
+        if (_result != null) ShowTitles();
+    }
+
+    // --------------------------------------------------------------- analisi
 
     private async Task RunAnalysisAsync(string imageFile)
     {
@@ -182,93 +193,78 @@ public partial class MainForm : Form
 
         _cts = new CancellationTokenSource();
         var ct = _cts.Token;
-        var progress = CreateProgress();
 
         lstTitles.Items.Clear();
-        _source?.Dispose(); _source = null;
-        _drive?.Dispose(); _drive = null;
-        _analysis = null;
-        _imagePath = null;
+        lblDiscInfo.Text = "";
+        _result = null;
+        ReleaseSource();
 
         SetBusy(true);
 
         try
         {
+            long lastWritten = -1;
+            string mediaText = "", statusText = "";
+
             if (imageFile != null)
             {
-                Log($"Apro l'immagine {imageFile}");
-                _source = new ImageSectorSource(imageFile);
-                _imagePath = imageFile;
-                _analysis = new DiscAnalysis
-                {
-                    SourceName = Path.GetFileName(imageFile),
-                    LastWrittenLba = _source.TotalSectors - 1,
-                    ScannedSectors = _source.TotalSectors
-                };
+                Log($"Apro {Path.GetFileName(imageFile)}");
+
+                _image = await Task.Run(() => DiscImage.Open(imageFile), ct);
+                Log($"Formato riconosciuto: {_image.FormatName}");
+                foreach (var note in _image.Notes) Log("  " + note);
+
+                _source = _image.GetDataSource();
+                mediaText = _image.FormatName;
             }
             else
             {
                 if (cmbDrives.SelectedItem is not OpticalDriveEntry entry)
                 {
-                    MessageBox.Show("Seleziona un lettore.", "DVDRescue", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBox.Show("Seleziona un lettore.", "DVDRescue",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
                 }
 
                 Log($"Apro l'unità {entry.Letter}: ({entry.Description})");
 
-                int speedKb = cmbSpeed.SelectedIndex switch
+                int speed = cmbSpeed.SelectedIndex switch
                 {
                     1 => 11080,   // 8x
                     2 => 5540,    // 4x
                     3 => 2770,    // 2x
-                    _ => 0        // massima: non tocca il lettore
+                    _ => 0
                 };
 
-                var probe = await Task.Run(() => DiscEngine.ProbeDrive(entry.Letter, Log, ct, speedKb), ct);
-                _drive = probe.Drive;
-                _source = probe.Source;
-                _analysis = probe.Analysis;
+                var opened = await Task.Run(() => DriveAccess.Open(entry.Letter, speed, Log, ct), ct);
+                _drive = opened.Drive;
+                _source = opened.Source;
+                lastWritten = opened.LastWrittenSector;
+                mediaText = opened.MediaText;
+                statusText = opened.DiscStatusText;
+                foreach (var note in opened.Notes) Log("Nota: " + note);
 
-                if (chkMakeImage.Checked)
-                {
-                    string workFolder = txtWorkFolder.Text.Trim();
-                    Directory.CreateDirectory(workFolder);
-
-                    long needed = (_analysis.LastWrittenLba + 1) * 2048L;
-                    try
-                    {
-                        var di = new DriveInfo(Path.GetPathRoot(workFolder)!);
-                        if (di.AvailableFreeSpace < needed + (100L << 20))
-                        {
-                            var r = MessageBox.Show(
-                                $"Servono circa {needed / 1048576.0:F0} MB ma su {di.Name} ce ne sono {di.AvailableFreeSpace / 1048576.0:F0}.\r\n\r\n" +
-                                "Vuoi continuare comunque? (In alternativa annulla, scegli un'altra cartella o togli la spunta alla copia su immagine.)",
-                                "Spazio insufficiente", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-                            if (r != DialogResult.Yes) return;
-                        }
-                    }
-                    catch { /* controllo spazio non determinante */ }
-
-                    _imagePath = Path.Combine(workFolder, $"disco_{DateTime.Now:yyyyMMdd_HHmmss}.bin");
-                    Log($"Copio il disco in {_imagePath}");
-
-                    await DiscEngine.CreateImageAsync(_source, _imagePath, 0, _analysis.LastWrittenLba,
-                                                      progress, Log, ct);
-
-                    _source.Dispose();
-                    _drive.Dispose();
-                    _drive = null;
-
-                    _source = new ImageSectorSource(_imagePath);
-                    Log("Il disco può essere rimosso: da qui in avanti si lavora sull'immagine.");
-                }
+                if (chkSaveImage.Checked)
+                    await SaveDiscImageAsync(opened, ct);
             }
 
-            var analysis = _analysis;
             var source = _source;
+            bool deep = chkDeepScan.Checked;
+            var textProgress = CreateTextProgress();
 
-            _analysis = await Task.Run(() => DiscEngine.ScanContent(source, analysis, progress, Log, ct), ct);
-            PopulateTitles(_analysis);
+            var result = await Task.Run(() =>
+            {
+                var r = RecoveryEngine.Analyze(source, deep, textProgress, Log, ct);
+                r.LastWrittenSector = lastWritten;
+                r.MediaText = mediaText;
+                r.DiscStatusText = statusText;
+                return r;
+            }, ct);
+
+            _result = result;
+            foreach (var note in result.Notes) Log("· " + note);
+
+            ShowTitles();
         }
         catch (OperationCanceledException)
         {
@@ -285,35 +281,85 @@ public partial class MainForm : Form
             _lastProgress = null;
             progressBar.Value = 0;
             lblStatus.Text = lstTitles.Items.Count > 0
-                ? $"{lstTitles.Items.Count} titoli pronti per l'estrazione."
+                ? $"{lstTitles.Items.Count} video pronti."
                 : "Pronto.";
         }
     }
 
-    private void PopulateTitles(DiscAnalysis analysis)
+    private async Task SaveDiscImageAsync(DriveAccess.DriveOpenResult opened, CancellationToken ct)
+    {
+        string folder = txtWorkFolder.Text.Trim();
+        Directory.CreateDirectory(folder);
+
+        string path = Path.Combine(folder, $"disco_{DateTime.Now:yyyyMMdd_HHmmss}.bin");
+        Log($"Copio il disco in {path}");
+
+        var progress = CreateProgress();
+        var source = opened.Source;
+        long total = opened.LastWrittenSector + 1;
+
+        await Task.Run(async () =>
+        {
+            var buffer = new byte[256 * 2048];
+            await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 20);
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+
+            for (long sector = 0; sector < total; sector += 256)
+            {
+                ct.ThrowIfCancellationRequested();
+                int count = (int)Math.Min(256, total - sector);
+                source.ReadBlocks(sector, count, buffer, 0);
+                await output.WriteAsync(buffer.AsMemory(0, count * 2048), ct);
+
+                if (watch.ElapsedMilliseconds > 400)
+                {
+                    watch.Restart();
+                    double mb = (sector + count) * 2048.0 / 1048576.0;
+                    progress.Report(new ProgressReport
+                    {
+                        Stage = "Copia del disco",
+                        Detail = $"{mb:F0} MB di {total * 2048.0 / 1048576.0:F0} MB",
+                        Percent = (sector + count) * 100.0 / total
+                    });
+                }
+            }
+        }, ct);
+
+        Log($"Copia completata ({opened.Source.BadBlockCount} settori illeggibili).");
+    }
+
+    private void ShowTitles()
     {
         lstTitles.Items.Clear();
-        if (analysis?.Titles == null) return;
+        if (_result == null) return;
 
-        foreach (var t in analysis.Titles)
+        var mode = (SplitMode)Math.Max(0, cmbSplit.SelectedIndex);
+        var titles = RecoveryEngine.ApplySplit(_result, mode);
+
+        foreach (var title in titles)
         {
-            var item = new ListViewItem(t.Index.ToString()) { Checked = true, Tag = t };
-            item.SubItems.Add(t.DurationText);
-            item.SubItems.Add(t.SizeText);
-            item.SubItems.Add(t.StartLba.ToString());
-            item.SubItems.Add(t.Recorded?.ToString("dd/MM/yyyy HH:mm") ?? "—");
-            item.SubItems.Add(string.IsNullOrEmpty(t.SourceFile) ? "scansione diretta" : t.SourceFile);
+            var item = new ListViewItem(title.Index.ToString()) { Checked = true, Tag = title };
+            item.SubItems.Add(title.DurationText);
+            item.SubItems.Add(title.SizeText);
+            item.SubItems.Add(title.Recorded?.ToString("dd/MM/yyyy HH:mm") ?? "—");
+            item.SubItems.Add(title.VideoInfo);
+            item.SubItems.Add(title.Origin);
             lstTitles.Items.Add(item);
         }
 
-        lblSourceInfo.Text = analysis.FilesystemInfo;
+        var info = new List<string>();
+        if (!string.IsNullOrWhiteSpace(_result.ProfileText)) info.Add(_result.ProfileText);
+        if (!string.IsNullOrWhiteSpace(_result.FilesystemInfo)) info.Add(_result.FilesystemInfo);
+        if (!string.IsNullOrWhiteSpace(_result.VolumeLabel)) info.Add($"volume \"{_result.VolumeLabel}\"");
+        if (!string.IsNullOrWhiteSpace(_result.DiscStatusText)) info.Add($"disco {_result.DiscStatusText}");
+        lblDiscInfo.Text = string.Join("  ·  ", info);
 
-        foreach (var note in analysis.Notes) Log("Nota: " + note);
+        if (mode == SplitMode.PerChapter && _result.ChapterTitles.Count == 0)
+            Log("Questo disco non dichiara capitoli: resto sulla divisione per registrazione.");
 
-        if (analysis.Titles.Count == 0)
+        if (titles.Count == 0)
         {
-            Log("Nessun video individuato. Suggerimenti: prova un altro lettore (i DVD-RAM/8 cm non sono letti da tutti),");
-            Log("pulisci il disco, oppure riapri l'immagine già creata e riprova con una soglia diversa.");
+            Log("Nessun video individuato. Prova un altro lettore, oppure spunta la scansione approfondita.");
         }
 
         btnExtract.Enabled = lstTitles.Items.Count > 0 && !_busy;
@@ -323,34 +369,37 @@ public partial class MainForm : Form
 
     private async void BtnExtract_Click(object sender, EventArgs e)
     {
-        if (_busy || _source == null || _analysis == null) return;
+        if (_busy || _source == null || _result == null) return;
 
         var selected = lstTitles.Items.Cast<ListViewItem>()
             .Where(i => i.Checked)
-            .Select(i => (VideoTitle)i.Tag)
+            .Select(i => (RecoveryTitle)i.Tag)
             .ToList();
 
         if (selected.Count == 0)
         {
-            MessageBox.Show("Seleziona almeno un titolo.", "DVDRescue", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show("Seleziona almeno un video.", "DVDRescue",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
         var options = new ExtractOptions
         {
             OutputFolder = txtOutFolder.Text.Trim(),
+            Split = (SplitMode)Math.Max(0, cmbSplit.SelectedIndex),
             MakeH264 = chkH264.Checked,
             MakeRemux = chkRemux.Checked,
-            KeepMpg = chkKeepMpg.Checked,
+            KeepRaw = chkKeepRaw.Checked,
             Crf = (int)numCrf.Value,
             Preset = cmbPreset.SelectedItem?.ToString() ?? "medium",
             Deinterlace = chkDeinterlace.Checked,
-            FileNamePrefix = string.IsNullOrWhiteSpace(txtPrefix.Text) ? "titolo" : txtPrefix.Text.Trim()
+            FileNamePrefix = txtPrefix.Text
         };
 
-        if (!options.MakeH264 && !options.MakeRemux && !options.KeepMpg)
+        if (!options.MakeH264 && !options.MakeRemux && !options.KeepRaw)
         {
-            MessageBox.Show("Scegli almeno un formato di uscita.", "DVDRescue", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show("Scegli almeno un formato di uscita.", "DVDRescue",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -370,82 +419,40 @@ public partial class MainForm : Form
 
                 if (_ffmpegPath == null)
                 {
-                    var r = MessageBox.Show(
-                        "ffmpeg non è presente. Lo scarico adesso (circa 40 MB dalle build ufficiali gyan.dev)?",
+                    var answer = MessageBox.Show(
+                        "ffmpeg non è presente. Lo scarico adesso (circa 40 MB)?",
                         "ffmpeg mancante", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
 
-                    if (r == DialogResult.Yes)
-                    {
+                    if (answer == DialogResult.Yes)
                         _ffmpegPath = await FfmpegLocator.DownloadAsync(new Progress<string>(Log), ct);
-                    }
                     else
                     {
-                        Log("Conversione disattivata: verranno salvati solo i file .mpg grezzi.");
+                        Log("Conversione disattivata: salvo solo i flussi grezzi.");
                         options.MakeH264 = false;
                         options.MakeRemux = false;
-                        options.KeepMpg = true;
+                        options.KeepRaw = true;
                     }
                 }
             }
 
             var runner = _ffmpegPath != null ? new FfmpegRunner(_ffmpegPath) : null;
-            string mpgFolder = options.KeepMpg
-                ? options.OutputFolder
-                : Path.Combine(Path.GetTempPath(), "DVDRescue_" + Guid.NewGuid().ToString("N")[..8]);
-            Directory.CreateDirectory(mpgFolder);
-
+            var source = _source;
             int done = 0;
+
             foreach (var title in selected)
             {
                 ct.ThrowIfCancellationRequested();
                 done++;
 
-                string baseName = DiscEngine.BuildBaseName(title, options);
-                string mpgPath = Path.Combine(mpgFolder, baseName + ".mpg");
+                Log($"— {title.Name} ({done} di {selected.Count}): {title.DurationText}, {title.SizeText}");
 
-                Log($"— Titolo {title.Index} ({done} di {selected.Count}): {title.DurationText}, {title.SizeText}");
-
-                var source = _source;
-                long bytes = await Task.Run(() =>
-                    DiscEngine.WriteTitleStreamAsync(source, title, mpgPath, progress, ct), ct);
-
-                Log($"  stream estratto: {bytes / 1048576.0:F0} MB → {Path.GetFileName(mpgPath)}");
-
-                if (runner != null && options.MakeH264)
-                {
-                    string outPath = Path.Combine(options.OutputFolder, baseName + ".mp4");
-                    Log($"  converto in H.264: {Path.GetFileName(outPath)}");
-                    int code = await runner.RunAsync(
-                        FfmpegRunner.BuildH264Args(mpgPath, outPath, options),
-                        title.DurationSeconds, $"Conversione {done}/{selected.Count}", progress, Log, ct);
-                    Log(code == 0 ? "  fatto." : $"  ffmpeg ha restituito il codice {code}.");
-                }
-
-                if (runner != null && options.MakeRemux)
-                {
-                    string outPath = Path.Combine(options.OutputFolder, baseName + "_originale.mp4");
-                    Log($"  remux senza ricodifica: {Path.GetFileName(outPath)}");
-                    int code = await runner.RunAsync(
-                        FfmpegRunner.BuildRemuxArgs(mpgPath, outPath),
-                        title.DurationSeconds, $"Remux {done}/{selected.Count}", progress, Log, ct);
-                    Log(code == 0 ? "  fatto." : $"  ffmpeg ha restituito il codice {code}.");
-                }
-
-                if (!options.KeepMpg)
-                {
-                    try { File.Delete(mpgPath); } catch { }
-                }
+                await TitleExtractor.ExtractAsync(source, title, options, runner, progress, Log, ct);
             }
 
-            if (!options.KeepMpg)
-            {
-                try { Directory.Delete(mpgFolder, true); } catch { }
-            }
+            Log($"Completato: {selected.Count} file in {options.OutputFolder}");
 
-            Log($"Completato: {selected.Count} titoli elaborati in {options.OutputFolder}");
-
-            if (MessageBox.Show("Estrazione completata. Vuoi aprire la cartella di destinazione?",
-                    "DVDRescue", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+            if (MessageBox.Show("Fatto. Apro la cartella?", "DVDRescue",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
             {
                 System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
                 {

@@ -1,9 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    Banco di prova della logica di recupero: gira su Windows e su Linux perché
-    non tocca WinForms, solo i file di analisi disco e carving MPEG.
-    Prima di eseguirlo genera le immagini di prova con make-test-images.sh.
+    Banco di prova del motore di recupero: gira su Windows e su Linux perché include
+    tutto il progetto tranne l'interfaccia grafica.
+    Il materiale di prova si genera con make-test-images.sh.
   -->
 
   <PropertyGroup>
@@ -20,17 +20,12 @@
 
   <ItemGroup>
     <Compile Include="Program.cs" />
-    <Compile Include="..\..\src\DVDRescue\Model\Models.cs" />
-    <Compile Include="..\..\src\DVDRescue\Native\NativeMethods.cs" />
-    <Compile Include="..\..\src\DVDRescue\Native\AlignedBuffer.cs" />
-    <Compile Include="..\..\src\DVDRescue\Native\OpticalDrive.cs" />
-    <Compile Include="..\..\src\DVDRescue\Disc\ISectorSource.cs" />
-    <Compile Include="..\..\src\DVDRescue\Disc\UdfReader.cs" />
-    <Compile Include="..\..\src\DVDRescue\Disc\Iso9660Reader.cs" />
-    <Compile Include="..\..\src\DVDRescue\Disc\DiscEngine.cs" />
-    <Compile Include="..\..\src\DVDRescue\Media\MpegCarver.cs" />
-    <Compile Include="..\..\src\DVDRescue\Media\FfmpegRunner.cs" />
-    <Compile Include="..\..\src\DVDRescue\Media\FfmpegLocator.cs" />
+    <Compile Include="..\..\src\DVDRescue\**\*.cs" />
+    <Compile Remove="..\..\src\DVDRescue\MainForm.cs" />
+    <Compile Remove="..\..\src\DVDRescue\MainForm.Designer.cs" />
+    <Compile Remove="..\..\src\DVDRescue\Program.cs" />
+    <Compile Remove="..\..\src\DVDRescue\bin\**\*.cs" />
+    <Compile Remove="..\..\src\DVDRescue\obj\**\*.cs" />
   </ItemGroup>
 
 </Project>
