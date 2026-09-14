@@ -1,0 +1,158 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  PROJECT: src/DVDRescue/DVDRescue.csproj
+
+jobs:
+  # Verifica la logica di recupero (carving MPEG, UDF, ISO 9660, conversione)
+  # su immagini di prova generate al volo. Gira su Linux perché non tocca l'interfaccia.
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Strumenti di supporto
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ffmpeg genisoimage
+
+      - name: Genera le immagini di prova
+        run: bash tests/TestHarness/make-test-images.sh
+
+      - name: Esegui i test
+        working-directory: tests/TestHarness
+        run: dotnet run --project TestHarness.csproj -c Release
+
+  build:
+    runs-on: windows-latest
+    needs: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Versione dal tag
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -match '^v(\d+\.\d+\.\d+)') { $v = $Matches[1] } else { $v = "1.0.0" }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Versione: $v"
+
+      - name: Restore
+        run: dotnet restore ${{ env.PROJECT }} -r win-x64
+
+      - name: Publish (exe singolo, self-contained)
+        run: >
+          dotnet publish ${{ env.PROJECT }}
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -p:DebugType=none
+          -p:Version=${{ steps.ver.outputs.version }}
+          -p:FileVersion=${{ steps.ver.outputs.version }}.0
+          -p:AssemblyVersion=${{ steps.ver.outputs.version }}.0
+          -o publish
+
+      - name: Scarica ffmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path ffmpeg-tmp | Out-Null
+
+          $ok = $false
+          try {
+            Write-Host "Provo gyan.dev..."
+            Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
+                              -OutFile "ffmpeg-tmp/ffmpeg.zip" -UseBasicParsing -TimeoutSec 300
+            $ok = $true
+          } catch {
+            Write-Warning "gyan.dev non raggiungibile: $_"
+          }
+
+          if (-not $ok) {
+            Write-Host "Provo BtbN/FFmpeg-Builds..."
+            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest" -UseBasicParsing
+            $asset = $rel.assets | Where-Object { $_.name -like "*win64-gpl-*.zip" -and $_.name -notlike "*shared*" } | Select-Object -First 1
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "ffmpeg-tmp/ffmpeg.zip" -UseBasicParsing -TimeoutSec 600
+          }
+
+          Expand-Archive -Path "ffmpeg-tmp/ffmpeg.zip" -DestinationPath "ffmpeg-tmp/x" -Force
+          $exe = Get-ChildItem -Path "ffmpeg-tmp/x" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          if (-not $exe) { throw "ffmpeg.exe non trovato nell'archivio" }
+
+          New-Item -ItemType Directory -Force -Path "publish/ffmpeg" | Out-Null
+          Copy-Item $exe.FullName "publish/ffmpeg/ffmpeg.exe" -Force
+          Write-Host "ffmpeg incluso: $((Get-Item 'publish/ffmpeg/ffmpeg.exe').Length / 1MB) MB"
+
+      - name: Prepara i pacchetti
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          # pacchetto completo (app + ffmpeg)
+          Copy-Item README.md publish/ -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path "publish/*" -DestinationPath "dist/DVDRescue-$v-win-x64-con-ffmpeg.zip" -Force
+
+          # pacchetto leggero: solo l'exe, ffmpeg viene scaricato al primo uso
+          New-Item -ItemType Directory -Force -Path slim | Out-Null
+          Copy-Item publish/DVDRescue.exe slim/ -Force
+          Copy-Item README.md slim/ -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path "slim/*" -DestinationPath "dist/DVDRescue-$v-win-x64.zip" -Force
+
+          Get-ChildItem dist | Format-Table Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
+
+      - name: Carica gli artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DVDRescue-win-x64
+          path: dist/*.zip
+          retention-days: 30
+
+      - name: Crea la release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          draft: false
+          generate_release_notes: true
+          body: |
+            **DVDRescue ${{ steps.ver.outputs.version }}**
+
+            Recupero video da DVD non finalizzati (miniDVD delle videocamere, DVD-VR, registrazioni interrotte) ed esportazione diretta in MP4.
+
+            | Pacchetto | Cosa contiene |
+            |---|---|
+            | `DVDRescue-${{ steps.ver.outputs.version }}-win-x64-con-ffmpeg.zip` | applicazione + ffmpeg già incluso (consigliato) |
+            | `DVDRescue-${{ steps.ver.outputs.version }}-win-x64.zip` | solo l'applicazione, ffmpeg viene scaricato al primo utilizzo |
+
+            Nessuna installazione: si scompatta e si avvia `DVDRescue.exe`.
+            Windows chiederà i permessi di amministratore, indispensabili per leggere il lettore a livello di settore.
