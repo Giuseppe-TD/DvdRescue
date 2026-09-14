@@ -1,11 +1,17 @@
+using System.Diagnostics;
 using DVDRescue.Native;
 
 namespace DVDRescue.Recovery;
 
 /// <summary>
-/// Apertura del lettore e individuazione dell'area realmente scritta.
-/// Sui dischi non finalizzati il lettore dichiara spesso valori ottimistici
-/// o non ne dichiara affatto, quindi il dato va verificato leggendo.
+/// Apertura del lettore e, solo quando serve davvero, individuazione dell'area scritta.
+///
+/// La differenza di velocità sta tutta in quel "quando serve davvero": interrogare il lettore
+/// costa qualche decimo di secondo, mentre cercare a tentoni l'ultimo settore leggibile costa
+/// minuti, perché ogni sondaggio a vuoto fa ritentare il lettore. Se il disco ha un filesystem
+/// e le sue strutture di navigazione — il caso normale — quel limite non serve a nulla:
+/// si leggono le IFO e si sa già dove stanno i video. Per questo la ricerca viene rimandata
+/// al momento in cui l'unica strada rimasta è la scansione dei settori.
 /// </summary>
 public static class DriveAccess
 {
@@ -13,16 +19,22 @@ public static class DriveAccess
     {
         public OpticalDrive Drive;
         public OpticalBlockSource Source;
-        public long LastWrittenSector = -1;
+
+        /// <summary>Stima dichiarata dal lettore, non ancora verificata leggendo.</summary>
+        public long EstimatedLastSector = -1;
+
+        public bool LimitVerified;
         public string MediaText = "";
         public string DiscStatusText = "";
         public List<string> Notes = new();
     }
 
-    public static DriveOpenResult Open(string driveLetter, int readSpeedKbPerSec,
+    public static DriveOpenResult Open(string driveLetter, int readSpeedKbPerSec, bool thorough,
                                        Action<string> log, CancellationToken ct)
     {
         log ??= _ => { };
+        var watch = Stopwatch.StartNew();
+
         var drive = OpticalDrive.Open(driveLetter);
         var result = new DriveOpenResult { Drive = drive };
 
@@ -65,7 +77,7 @@ public static class DriveAccess
                 log($"Supporto: {physical.BookTypeText}, area dati {physical.DataAreaStart}–{physical.DataAreaEnd}.");
             }
 
-            long lastWritten = -1;
+            long lastSector = -1;
 
             if (info != null)
             {
@@ -80,38 +92,36 @@ public static class DriveAccess
 
                     long end = track.EstimatedLastWrittenLba;
                     log($"Traccia {t}: inizio {track.TrackStart}, dimensione {track.TrackSize}, ultimo scritto {(end >= 0 ? end.ToString() : "n/d")}.");
-                    if (end > lastWritten) lastWritten = end;
+                    if (end > lastSector) lastSector = end;
                 }
             }
 
-            if (lastWritten <= 0)
+            if (lastSector <= 0)
             {
                 long capacity = drive.ReadCapacity();
                 if (capacity > 0)
                 {
-                    lastWritten = capacity;
-                    log($"Nessun dato utile dalle tracce: uso la capacità dichiarata ({capacity} settori).");
+                    lastSector = capacity;
+                    log($"Le tracce non dicono nulla di utile: uso la capacità dichiarata ({capacity} settori).");
                 }
                 else
                 {
-                    lastWritten = 2_295_104;
-                    log("Nessun dato dal lettore: parto dalla capacità di un DVD a strato singolo.");
+                    lastSector = 2_295_104;
+                    log("Il lettore non fornisce dati: parto dalla capacità di un DVD a strato singolo.");
                 }
             }
 
-            var source = new OpticalBlockSource(drive, lastWritten + 1, ownsDrive: false);
-
-            long verified = VerifyLastReadable(source, lastWritten, log, ct);
-            if (verified > 0 && verified != lastWritten)
-                log($"Limite corretto dopo la verifica: ultimo settore leggibile {verified} invece di {lastWritten}.");
-            if (verified > 0) lastWritten = verified;
-
-            source.SetTotalBlocks(lastWritten + 1);
+            var source = new OpticalBlockSource(drive, lastSector + 1, ownsDrive: false)
+            {
+                ThoroughMode = thorough
+            };
 
             result.Source = source;
-            result.LastWrittenSector = lastWritten;
+            result.EstimatedLastSector = lastSector;
 
-            log($"Area utilizzabile: {lastWritten + 1} settori, circa {(lastWritten + 1) * 2048.0 / 1048576.0:F0} MB.");
+            log($"Area dichiarata: {lastSector + 1} settori, circa {(lastSector + 1) * 2048.0 / 1048576.0:F0} MB " +
+                $"(interrogazione completata in {watch.ElapsedMilliseconds} ms).");
+
             return result;
         }
         catch
@@ -121,10 +131,17 @@ public static class DriveAccess
         }
     }
 
-    private static long VerifyLastReadable(OpticalBlockSource source, long declared,
-                                           Action<string> log, CancellationToken ct)
+    /// <summary>
+    /// Trova l'ultimo settore davvero leggibile. Va chiamata solo prima di una scansione:
+    /// ogni sondaggio a vuoto costa secondi, quindi il numero di tentativi è tenuto basso.
+    /// </summary>
+    public static long VerifyWrittenLimit(OpticalBlockSource source, long declared,
+                                          Action<string> log, CancellationToken ct)
     {
+        log ??= _ => { };
         if (declared <= 0) return -1;
+
+        var watch = Stopwatch.StartNew();
 
         if (!source.ProbeSector(0))
         {
@@ -134,42 +151,26 @@ public static class DriveAccess
 
         if (source.ProbeSector(declared))
         {
-            long high = declared;
-            long step = 1024;
-            long ceiling = Math.Max(declared * 2, 12_500_000);   // oltre un Blu-ray a doppio strato
-
-            while (high + step < ceiling && source.ProbeSector(high + step))
-            {
-                ct.ThrowIfCancellationRequested();
-                high += step;
-                step *= 2;
-            }
-
-            if (high == declared) return declared;
-
-            long low = high, top = Math.Min(high + step, ceiling);
-            while (low + 1 < top)
-            {
-                ct.ThrowIfCancellationRequested();
-                long middle = low + (top - low) / 2;
-                if (source.ProbeSector(middle)) low = middle; else top = middle;
-            }
-            return low;
+            log($"L'ultimo settore dichiarato ({declared}) è leggibile: limite confermato in {watch.ElapsedMilliseconds} ms.");
+            return declared;
         }
 
-        log("L'ultimo settore dichiarato non è leggibile: cerco il limite reale.");
+        log("L'ultimo settore dichiarato non è leggibile: cerco il limite reale (pochi tentativi).");
 
-        long lo = 0, hi = declared;
-        int iterations = 0;
+        long low = 0, high = declared;
+        int probes = 0;
+        const int maxProbes = 14;     // precisione di circa 1/16000 del disco: più che sufficiente
 
-        while (lo + 1 < hi && iterations++ < 40)
+        while (low + 1 < high && probes < maxProbes)
         {
             ct.ThrowIfCancellationRequested();
-            long middle = lo + (hi - lo) / 2;
-            if (source.ProbeSector(middle)) lo = middle; else hi = middle;
-            if (iterations % 6 == 0) log($"  ricerca del limite fra i settori {lo} e {hi}...");
+            long middle = low + (high - low) / 2;
+            probes++;
+
+            if (source.ProbeSector(middle)) low = middle; else high = middle;
         }
 
-        return lo;
+        log($"Limite individuato al settore {low} con {probes} sondaggi in {watch.ElapsedMilliseconds} ms.");
+        return low;
     }
 }

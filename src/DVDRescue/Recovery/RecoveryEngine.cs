@@ -16,46 +16,82 @@ namespace DVDRescue.Recovery;
 /// </summary>
 public static class RecoveryEngine
 {
+    /// <param name="verifyWrittenLimit">
+    /// Restituisce l'ultimo settore davvero leggibile. Viene invocata solo se si arriva alla
+    /// scansione dei settori: sui dischi con strutture leggibili quella ricerca, che costa
+    /// secondi per ogni sondaggio a vuoto, va evitata del tutto.
+    /// </param>
+    /// <param name="preciseSplit">
+    /// Vero quando all'utente servono le registrazioni separate: allora i confini vanno cercati
+    /// davvero. Falso quando vuole un file unico, e si può prendere tutta l'area scritta.
+    /// </param>
     public static RecoveryResult Analyze(IBlockSource source, bool forceDeepScan,
+                                         Func<long> verifyWrittenLimit,
                                          IProgress<string> progress, Action<string> log,
-                                         CancellationToken ct)
+                                         CancellationToken ct, bool preciseSplit = true)
     {
         log ??= _ => { };
         var result = new RecoveryResult { Source = source };
+        var watch = System.Diagnostics.Stopwatch.StartNew();
 
-        // ------------------------------------------------------------ filesystem
-        if (!forceDeepScan)
-            ReadFileSystem(source, result, log, ct);
+        // Le strutture del disco si leggono a piccoli morsi sparsi: davanti alla sorgente
+        // si mette una cache con lettura anticipata, altrimenti ogni descrittore costa una
+        // ricerca della testina. Le letture grandi le passano attraverso senza essere toccate.
+        var cached = source as CachingBlockSource ?? new CachingBlockSource(source);
 
-        result.Profile = Classify(result.Files);
-        result.ProfileText = Describe(result.Profile);
-        log($"Tipo di disco: {result.ProfileText}");
+        // durante il riconoscimento si sonda anche fuori dall'area scritta: meglio non
+        // restare appesi trenta secondi su un settore che non esiste
+        var optical = Unwrap(source) as OpticalBlockSource;
+        int previousTimeout = optical?.ReadTimeout ?? 0;
+        if (optical != null) optical.ReadTimeout = Math.Min(previousTimeout, 5);
 
-        // -------------------------------------------------------------- titoli
-        switch (result.Profile)
+        try
         {
-            case DiscProfile.DvdVideo:
-            case DiscProfile.DvdPartial:
-                if (!BuildFromDvdVideo(source, result, log, ct))
-                    BuildFromScan(source, result, log, progress, ct);
-                break;
+            // ------------------------------------------------------------ filesystem
+            if (!forceDeepScan)
+            {
+                ReadFileSystem(cached, result, log, ct);
+                log($"Filesystem letto in {watch.ElapsedMilliseconds} ms " +
+                    $"({cached.DeviceReads} letture al lettore).");
+            }
 
-            case DiscProfile.DvdVr:
-                if (!BuildFromDvdVr(source, result, log, ct))
-                    BuildFromScan(source, result, log, progress, ct);
-                break;
+            result.Profile = Classify(result.Files);
+            result.ProfileText = Describe(result.Profile);
+            log($"Tipo di disco: {result.ProfileText}");
 
-            case DiscProfile.Bdmv:
-            case DiscProfile.Bdav:
-            case DiscProfile.Avchd:
-                if (!BuildFromBluray(source, result, log, ct))
-                    BuildFromScan(source, result, log, progress, ct);
-                break;
+            // -------------------------------------------------------------- titoli
+            switch (result.Profile)
+            {
+                case DiscProfile.DvdVideo:
+                case DiscProfile.DvdPartial:
+                    if (!BuildFromDvdVideo(cached, result, log, ct))
+                        BuildFromScan(source, result, verifyWrittenLimit, forceDeepScan, preciseSplit, log, progress, ct);
+                    break;
 
-            default:
-                BuildFromScan(source, result, log, progress, ct);
-                break;
+                case DiscProfile.DvdVr:
+                    if (!BuildFromDvdVr(cached, result, log, ct))
+                        BuildFromScan(source, result, verifyWrittenLimit, forceDeepScan, preciseSplit, log, progress, ct);
+                    break;
+
+                case DiscProfile.Bdmv:
+                case DiscProfile.Bdav:
+                case DiscProfile.Avchd:
+                    if (!BuildFromBluray(cached, result, log, ct))
+                        BuildFromScan(source, result, verifyWrittenLimit, forceDeepScan, preciseSplit, log, progress, ct);
+                    break;
+
+                default:
+                    BuildFromScan(source, result, verifyWrittenLimit, forceDeepScan, preciseSplit, log, progress, ct);
+                    break;
+            }
         }
+        finally
+        {
+            if (optical != null) optical.ReadTimeout = previousTimeout;
+        }
+
+        log($"Analisi completata in {watch.Elapsed.TotalSeconds:F1} s " +
+            $"({cached.DeviceReads} letture al lettore, {cached.CacheHits} servite dalla cache).");
 
         for (int i = 0; i < result.Titles.Count; i++) result.Titles[i].Index = i + 1;
         for (int i = 0; i < result.ChapterTitles.Count; i++) result.ChapterTitles[i].Index = i + 1;
@@ -72,12 +108,19 @@ public static class RecoveryEngine
 
     // --------------------------------------------------------------- filesystem
 
+    /// <summary>Restituisce la sorgente sotto l'eventuale cache.</summary>
+    private static IBlockSource Unwrap(IBlockSource source)
+        => source is CachingBlockSource caching ? caching.Inner : source;
+
     private static void ReadFileSystem(IBlockSource source, RecoveryResult result,
                                        Action<string> log, CancellationToken ct)
     {
         IFileSystem best = null;
         int bestCount = 0;
 
+        // UDF per primo: sui dischi video c'è quasi sempre ed è il più informativo.
+        // Appena uno dei due dà dei file ci si ferma: leggerli entrambi raddoppia il lavoro
+        // e sui DVD-Video il risultato è lo stesso.
         foreach (var candidate in EnumerateFileSystems(source))
         {
             try
@@ -87,6 +130,7 @@ public static class RecoveryEngine
                 log($"{candidate.TypeName}: {count} file.");
 
                 if (count > bestCount) { best = candidate; bestCount = count; }
+                if (bestCount > 0) break;
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -396,14 +440,14 @@ public static class RecoveryEngine
     // ------------------------------------------------------ scansione settori
 
     private static void BuildFromScan(IBlockSource source, RecoveryResult result,
+                                      Func<long> verifyWrittenLimit, bool forceDeepScan, bool preciseSplit,
                                       Action<string> log, IProgress<string> progress, CancellationToken ct)
     {
         long start = 0;
-        long end = result.LastWrittenSector > 0
-            ? (result.LastWrittenSector + 1) * 2048L
-            : source.Length;
+        long end = source.Length;
 
-        // se il filesystem esiste ma le strutture no, si cercano solo i file video
+        // se il filesystem esiste ma le strutture no, si cercano solo i file video:
+        // in quel caso l'estensione dell'area scritta non serve e non va cercata
         var videoFiles = result.Files
             .Where(f => IsVideoFile(f.Key))
             .OrderBy(f => f.Value.Offset)
@@ -417,11 +461,33 @@ public static class RecoveryEngine
         }
         else
         {
-            log("Scansione dell'area scritta alla ricerca di stream video...");
+            // qui sì: si sta per passare in rassegna il disco, conviene sapere dove finisce
+            if (verifyWrittenLimit != null)
+            {
+                long limit = verifyWrittenLimit();
+                if (limit > 0)
+                {
+                    result.LastWrittenSector = limit;
+                    end = (limit + 1) * 2048L;
+                }
+            }
+            else if (result.LastWrittenSector > 0)
+            {
+                end = (result.LastWrittenSector + 1) * 2048L;
+            }
+
+            // Se all'utente serve un file solo, i confini fra una registrazione e l'altra non
+            // interessano: si prende tutta l'area scritta e si misura la durata con due letture,
+            // invece di passare in rassegna un gigabyte alla velocità del lettore.
+            if (!preciseSplit && TryQuickScan(source, result, start, end, log))
+                return;
+
+            log($"Ricerca degli stream video fino al settore {end / 2048 - 1}...");
         }
 
-        // Program Stream (DVD)
-        var psCarver = new MpegPsCarver();
+        // Program Stream (DVD). Con la scansione approfondita si rinuncia anche ai salti
+        // dentro le zone vuote: più lento, ma non può sfuggire nemmeno una clip di un secondo.
+        var psCarver = new MpegPsCarver { SkipEmptyAreas = !forceDeepScan };
         var psSegments = psCarver.Scan(source, start, end, progress, ct);
 
         foreach (var segment in psSegments)
@@ -474,6 +540,83 @@ public static class RecoveryEngine
                     Ranges = { new RecoveryRange(fragment.StartByte, fragment.Length) }
                 });
         }
+    }
+
+    /// <summary>
+    /// Prende l'intera area scritta come un'unica registrazione: cerca il primo e l'ultimo
+    /// settore video e si ferma lì. Costa due letture invece dell'intero disco, e va benissimo
+    /// quando l'uscita richiesta è un file unico — i settori inutili vengono comunque scartati
+    /// durante l'estrazione.
+    /// </summary>
+    private static bool TryQuickScan(IBlockSource source, RecoveryResult result,
+                                     long startByte, long endByte, Action<string> log)
+    {
+        const int window = 512;   // 1 MB
+        long lastSector = endByte / 2048 - 1;
+        long firstSector = startByte / 2048;
+        if (lastSector <= firstSector) return false;
+
+        var buffer = new byte[window * 2048];
+
+        // primo settore video: nei primi megabyte c'è l'area di sistema, poi comincia il video
+        long start = -1;
+        for (long sector = firstSector; sector < Math.Min(firstSector + window * 8, lastSector); sector += window)
+        {
+            int count = (int)Math.Min(window, lastSector - sector + 1);
+            source.ReadBlocks(sector, count, buffer, 0);
+
+            for (int i = 0; i < count; i++)
+                if (MpegPsCarver.IsPackHeader(buffer, i * 2048)) { start = sector + i; break; }
+
+            if (start >= 0) break;
+        }
+
+        if (start < 0)
+        {
+            log("Nessun video nei primi megabyte: passo alla ricerca completa.");
+            return false;
+        }
+
+        // ultimo settore video, cercato a ritroso dalla fine dell'area scritta.
+        // Su un disco non finalizzato il video finisce dove finisce la scrittura, quindi
+        // di norma basta una lettura; il limite evita di risalire all'infinito se in coda
+        // c'è una zona vuota lunga.
+        long end = -1;
+        long backwardLimit = Math.Max(start, lastSector - window * 32);
+
+        for (long sector = Math.Max(start, lastSector - window + 1); sector > backwardLimit; sector -= window)
+        {
+            int count = (int)Math.Min(window, lastSector - sector + 1);
+            if (count <= 0) break;
+
+            source.ReadBlocks(sector, count, buffer, 0);
+
+            for (int i = count - 1; i >= 0; i--)
+                if (MpegPsCarver.IsPackHeader(buffer, i * 2048)) { end = sector + i; break; }
+
+            if (end >= 0) break;
+        }
+
+        if (end < 0) end = lastSector;
+        if (end <= start) return false;
+
+        long length = (end - start + 1) * 2048L;
+        double seconds = MpegPsCarver.MeasureSeconds(source, start * 2048L, length);
+
+        result.Titles.Add(new RecoveryTitle
+        {
+            Name = "registrazione completa",
+            Origin = "area scritta del disco",
+            Seconds = seconds,
+            Ranges = { new RecoveryRange(start * 2048L, length) }
+        });
+
+        result.QuickScan = true;
+        log($"Area video: settori {start}–{end}, {length / 1048576.0:F0} MB, " +
+            $"durata {TimeSpan.FromSeconds(seconds):hh\\:mm\\:ss}.");
+        log("Lettura rapida: per separare le singole registrazioni scegli un'altra divisione e rileggi il disco.");
+
+        return true;
     }
 
     private static string OwnerOf(List<KeyValuePair<string, (long Offset, long Length)>> files, long offset)

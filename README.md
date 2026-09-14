@@ -40,6 +40,50 @@ Poi lascia scegliere come dividere:
 - **Un file per registrazione** — utile quando sul disco ci sono riprese di giorni diversi
 - **Un file per capitolo** — quando il disco li dichiara
 
+### Analisi in secondi, non in minuti
+
+Su un lettore ottico il tempo se ne va in due modi: leggendo byte che non servono, e aspettando
+risposte su settori che non ci sono. Un lettore a cui si chiede un settore non scritto ritenta
+per conto suo prima di rispondere, quindi ogni richiesta a vuoto costa secondi.
+
+DVDRescue evita entrambe le cose:
+
+- **Il limite dell'area scritta si cerca solo se serve.** Se il disco ha filesystem e strutture
+  di navigazione — il caso normale — quel dato non serve a niente: si leggono le IFO e si sa già
+  dove sono i video. La ricerca a tentoni parte soltanto quando l'unica strada rimasta è la
+  scansione, e comunque con pochi sondaggi a timeout breve invece di decine a timeout lungo.
+- **Le strutture si leggono con lettura anticipata.** Descrittori UDF, tabella dei file e IFO
+  stanno in poche zone ma si leggono a morsi da un settore: centinaia di richieste, ognuna delle
+  quali costa una ricerca della testina. Con una cache che tira su 128 KB per volta le richieste
+  al lettore passano da decine a due o tre.
+- **La scansione salta il vuoto, mai il video.** Assaggiare il disco a intervalli fissi sembra
+  furbo e invece è il peggio dei due mondi: riempie il lettore di salti e rischia di non vedere
+  una ripresa più corta dell'intervallo. Qui il video si legge sempre tutto di seguito — che è
+  anche il modo in cui un lettore ottico va più veloce — e si salta soltanto dentro il vuoto,
+  dopo averne letto abbastanza da sapere che vuoto è. Il salto non supera mai i 4 MB, quindi non
+  può scavalcare una registrazione di più di quattro o cinque secondi; con la spunta *scansione
+  approfondita* i salti si disattivano del tutto.
+- **Sugli errori si rinuncia in fretta.** Un tentativo per settore, timeout corto, e un blocco
+  illeggibile non viene suddiviso fino al singolo settore: costava più di mille comandi al lettore
+  per un megabyte di nulla. Dopo qualche migliaio di settori illeggibili di fila la scansione si
+  ferma da sola: l'area scritta è finita.
+
+Misurato sul materiale di prova, contando le richieste al supporto (che è ciò che costa tempo su
+un lettore ottico, non i byte):
+
+| Caso | Letto | Richieste al lettore |
+|---|---|---|
+| DVD con strutture di navigazione | 0,2 MB su 23 MB | **2** (erano 26) |
+| Disco breve senza filesystem | 21 MB su 21 MB, di seguito | 26 |
+| Disco da 300 MB quasi vuoto | 93 MB su 300 MB | 98 |
+
+Il registro riporta i tempi di ogni fase e il numero di letture, così se qualcosa rallenta si vede
+subito dove.
+
+Per i dischi messi male c'è la spunta **Recupero insistente**: rimette i tentativi ripetuti e la
+suddivisione fino al singolo settore. Recupera di più, ma è molto più lento — va usata quando
+serve davvero, non per abitudine.
+
 ### Lettura al volo
 
 Non copia prima tutto il disco su un'immagine: i byte vanno dal lettore direttamente a ffmpeg
@@ -84,6 +128,11 @@ lavora sotto quel livello:
 | MP4 senza ricodifica | video copiato tale e quale, audio in AAC: immediato, qualità intatta |
 | Flusso grezzo | `.mpg` (DVD) o `.m2ts` (Blu-ray/AVCHD) così come sta sul disco |
 
+I file prendono il nome dal prefisso scelto, senza suffissi: `ripresa.mp4`. Se si chiedono
+entrambe le uscite MP4 serve per forza un secondo nome, e solo in quel caso compare
+`ripresa_originale.mp4` per la copia senza ricodifica. Estraendo di nuovo nella stessa cartella
+il file precedente non viene sovrascritto: il nuovo diventa `ripresa_2.mp4`.
+
 Il deinterlacciamento è attivo di default: le videocamere registrano interlacciato e senza
 quel passaggio si vedono i pettini sui movimenti.
 
@@ -92,6 +141,69 @@ da capo, quindi il `.mpg` può dichiarare una durata più corta del vero. I dati
 l'MP4 convertito riporta la durata giusta.
 
 ---
+
+## Salvare su un'unità di rete
+
+DVDRescue gira come amministratore, e Windows tiene separate le connessioni di rete delle due
+sessioni: le lettere mappate dall'utente (`Z:` verso `\\server\condivisione`) **non esistono**
+per un processo elevato, quindi non compaiono nella finestra di scelta della cartella. Non è un
+limite del programma, è come funziona l'elevazione dei privilegi.
+
+All'avvio DVDRescue legge le mappature salvate nel profilo dell'utente e le rifà nella propria
+sessione, usando le credenziali già memorizzate in Windows: nella maggior parte dei casi le
+unità ricompaiono da sole e il registro elenca quali.
+
+Il pulsante **Rete ▾** accanto alla cartella di destinazione apre tre possibilità:
+
+- **Connetti a una cartella di rete** — per le condivisioni che vogliono credenziali diverse da
+  quelle del computer: si scrive il percorso per esteso nella casella
+  (`\\server\condivisione\video`) e si inseriscono utente e password nella finestra di Windows.
+  Il percorso per esteso funziona sempre, anche senza lettera assegnata.
+- **Rendi le unità di rete sempre visibili** — attiva `EnableLinkedConnections` di Windows, che
+  collega le unità della sessione normale e di quella amministratore. È una modifica al sistema:
+  vale per tutti i programmi e per tutti gli utenti del computer, ha effetto dal riavvio
+  successivo, e si annulla dallo stesso menu (il valore viene rimosso, non azzerato, quindi il
+  sistema torna esattamente com'era). Comoda su un computer personale; su una postazione condivisa
+  conviene lasciar perdere e usare il percorso per esteso.
+- **Riprova a ripristinare le unità mappate** — rifà al volo il tentativo dell'avvio, utile se la
+  rete è tornata disponibile dopo.
+
+Due avvertenze pratiche. Il ripristino automatico funziona solo con le mappature **persistenti**:
+se la lettera è stata assegnata senza spuntare *Riconnetti all'accesso*, Windows non la salva nel
+profilo e non c'è niente da ripristinare — in quel caso si rimappa spuntando l'opzione, oppure si
+usa il percorso per esteso. E il percorso per esteso si può incollare anche **dentro** la finestra
+di scelta della cartella, nella casella "Cartella:" in basso: non serve che la lettera compaia
+nell'albero.
+
+Una lettera di rete scritta a mano (`Y:\riprese`) viene tradotta da sola nel percorso per esteso
+quando non è raggiungibile: il programma prova `Y:\riprese`, poi `\\server\condivisione\riprese`,
+e solo se fallisce anche quello chiede le credenziali. La casella si aggiorna con il percorso che
+ha funzionato, così la volta dopo parte già giusta.
+
+## Lettura rapida quando serve un file unico
+
+Su un disco senza filesystem — il caso dei miniDVD non finalizzati — trovare i confini fra una
+registrazione e l'altra richiede di passare in rassegna tutta l'area scritta: più di un gigabyte
+alla velocità del lettore, cioè qualche minuto.
+
+Ma se la divisione scelta è **Tutto in un unico file**, quei confini non servono a niente: il
+programma prende l'intera area scritta, individua il primo e l'ultimo settore video con due
+letture e ne misura la durata. Qualche secondo invece di qualche minuto. I settori inutili
+vengono scartati durante l'estrazione, quindi il risultato è lo stesso.
+
+Se poi servono le registrazioni separate, basta scegliere la divisione e premere di nuovo
+**Leggi disco**: il programma lo segnala nel registro.
+
+## Le impostazioni restano
+
+Cartella di destinazione, cartella della copia disco, modalità di divisione, formati di uscita,
+qualità, preset, prefisso dei nomi, velocità di lettura e lettore usato l'ultima volta vengono
+salvati alla chiusura e rimessi al prossimo avvio. Un percorso di rete incollato a mano viene
+conservato come qualsiasi altro.
+
+Il file è `%APPDATA%\DVDRescue\impostazioni.json`: niente registro e niente installazione, per
+spostare la configurazione su un altro computer basta copiarlo. Se si rovina o si cancella, il
+programma riparte dai valori predefiniti senza lamentarsi.
 
 ## Se non trova niente
 

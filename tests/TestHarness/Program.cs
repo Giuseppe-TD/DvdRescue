@@ -36,6 +36,10 @@ internal static class Program
         await TestSingleFileExtraction();
         await TestStreamingConversion();
         TestRawDisc();
+        TestReadVolume();
+        TestQuickScan();
+        await TestFileNames();
+        TestSettings();
         TestBadInput();
 
         Console.WriteLine($"\n=== {(_failures == 0 ? "TUTTI I CONTROLLI SUPERATI" : _failures + " CONTROLLI FALLITI")} ===");
@@ -52,7 +56,7 @@ internal static class Program
         if (!File.Exists(iso)) { Console.WriteLine("  (dvd.iso assente, salto)"); return; }
 
         using var source = new FileBlockSource(iso);
-        var result = RecoveryEngine.Analyze(source, false, null, Log, CancellationToken.None);
+        var result = RecoveryEngine.Analyze(source, false, null, null, Log, CancellationToken.None);
 
         Console.WriteLine($"  profilo: {result.ProfileText}");
         Console.WriteLine($"  filesystem: {result.FilesystemInfo}  volume: {result.VolumeLabel}");
@@ -86,8 +90,8 @@ internal static class Program
 
         using var source = new FileBlockSource(iso);
 
-        var withStructures = RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
-        var withScan = RecoveryEngine.Analyze(source, true, null, _ => { }, CancellationToken.None);
+        var withStructures = RecoveryEngine.Analyze(source, false, null, null, _ => { }, CancellationToken.None);
+        var withScan = RecoveryEngine.Analyze(source, true, null, null, _ => { }, CancellationToken.None);
 
         Console.WriteLine($"  leggendo le IFO:        {withStructures.Titles.Count} titoli");
         Console.WriteLine($"  scandendo i settori:    {withScan.Titles.Count} titoli");
@@ -98,7 +102,14 @@ internal static class Program
               $"{withScan.Titles.Count}");
 
         // la vecchia regola (taglio a ogni salto d'orologio) produceva 9 titoli su questo disco
-        var aggressive = new MpegPsCarver { SplitOnClockReset = true, ClockResetSeconds = 0.1, MaxGapSectors = 64, MinSegmentSectors = 128 };
+        var aggressive = new MpegPsCarver
+        {
+            SkipEmptyAreas = false,      // scansione completa, come faceva la prima versione
+            SplitOnClockReset = true,
+            ClockResetSeconds = 0.1,
+            MaxGapSectors = 64,
+            MinSegmentSectors = 128
+        };
         var aggressiveSegments = aggressive.Scan(source, 0, source.Length, null, CancellationToken.None);
         Console.WriteLine($"  col vecchio criterio:   {aggressiveSegments.Count} titoli");
         Check("il criterio prudente riduce nettamente i frammenti",
@@ -116,7 +127,7 @@ internal static class Program
         if (!File.Exists(iso)) { Console.WriteLine("  (dvd.iso assente, salto)"); return; }
 
         using var source = new FileBlockSource(iso);
-        var result = RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
+        var result = RecoveryEngine.Analyze(source, false, null, null, _ => { }, CancellationToken.None);
 
         var single = RecoveryEngine.ApplySplit(result, SplitMode.SingleFile);
         Check("l'unione produce un solo elemento", single.Count == 1, $"{single.Count}");
@@ -176,7 +187,7 @@ internal static class Program
         if (!File.Exists(iso) || ffmpeg == null) { Console.WriteLine("  (materiale o ffmpeg assenti, salto)"); return; }
 
         using var source = new FileBlockSource(iso);
-        var result = RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
+        var result = RecoveryEngine.Analyze(source, false, null, null, _ => { }, CancellationToken.None);
         var titles = RecoveryEngine.ApplySplit(result, SplitMode.SingleFile);
         if (titles.Count == 0) { Check("nessun titolo da convertire", false); return; }
 
@@ -234,7 +245,7 @@ internal static class Program
         if (!File.Exists(bin)) { Console.WriteLine("  (raw.bin assente, salto)"); return; }
 
         using var source = new FileBlockSource(bin);
-        var result = RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
+        var result = RecoveryEngine.Analyze(source, false, null, null, _ => { }, CancellationToken.None);
 
         foreach (var t in result.Titles)
             Console.WriteLine($"    #{t.Index} {t.DurationText} {t.SizeText,8}  {t.Origin}");
@@ -242,6 +253,290 @@ internal static class Program
         Check("ricade sulla scansione diretta", result.Profile == DVDRescue.Recovery.DiscProfile.RawVideo);
         Check("trova le due registrazioni separate", result.Titles.Count == 2, $"{result.Titles.Count}");
         Check("non le frammenta", result.Titles.All(t => t.Ranges.Count == 1));
+    }
+
+    // ------------------------------------------------ quanto disco viene letto
+
+    /// <summary>
+    /// Il tempo dell'analisi è proporzionale ai byte che si chiedono al lettore: su un lettore
+    /// ottico vero si viaggia sui 10-20 MB/s, quindi leggere tutto il disco per capire dove
+    /// sono i video significa minuti di attesa.
+    /// </summary>
+    private sealed class CountingSource : IBlockSource
+    {
+        private readonly IBlockSource _inner;
+        public long BytesRead;
+
+        /// <summary>Numero di richieste inoltrate: su un lettore ottico ognuna costa una ricerca.</summary>
+        public long Operations;
+
+        public CountingSource(IBlockSource inner) => _inner = inner;
+
+        public string Name => _inner.Name;
+        public int BlockSize => _inner.BlockSize;
+        public long TotalBlocks => _inner.TotalBlocks;
+        public long Length => _inner.Length;
+        public long BadBlockCount => _inner.BadBlockCount;
+
+        public int ReadBlocks(long block, int count, byte[] destination, int destinationOffset)
+        {
+            BytesRead += (long)count * BlockSize;
+            Operations++;
+            return _inner.ReadBlocks(block, count, destination, destinationOffset);
+        }
+
+        public bool TryReadBlock(long block, byte[] destination, int destinationOffset)
+        {
+            BytesRead += BlockSize;
+            Operations++;
+            return _inner.TryReadBlock(block, destination, destinationOffset);
+        }
+
+        public int ReadBytes(long byteOffset, int count, byte[] destination, int destinationOffset)
+        {
+            BytesRead += count;
+            Operations++;
+            return _inner.ReadBytes(byteOffset, count, destination, destinationOffset);
+        }
+
+        public void Dispose() { }
+    }
+
+    private static void TestQuickScan()
+    {
+        Section("Lettura rapida quando serve un file unico");
+
+        string path = Path.Combine(_media, "raw_grande.bin");
+        if (!File.Exists(path)) { Console.WriteLine("  (raw_grande.bin assente, salto)"); return; }
+
+        using var innerFast = new FileBlockSource(path);
+        using var fast = new CountingSource(innerFast);
+        var quick = RecoveryEngine.Analyze(fast, false, null, null, _ => { }, CancellationToken.None,
+                                           preciseSplit: false);
+
+        using var innerFull = new FileBlockSource(path);
+        using var full = new CountingSource(innerFull);
+        var precise = RecoveryEngine.Analyze(full, false, null, null, _ => { }, CancellationToken.None,
+                                             preciseSplit: true);
+
+        Console.WriteLine($"  file unico:        {fast.BytesRead / 1048576.0:F1} MB letti, " +
+                          $"{fast.Operations} richieste, {quick.Titles.Count} titolo/i");
+        Console.WriteLine($"  separati:          {full.BytesRead / 1048576.0:F1} MB letti, " +
+                          $"{full.Operations} richieste, {precise.Titles.Count} titoli");
+
+        Check("la lettura rapida produce un titolo solo", quick.Titles.Count == 1, $"{quick.Titles.Count}");
+        Check("ed è marcata come rapida", quick.QuickScan);
+        Check("legge molto meno del disco", fast.BytesRead < full.BytesRead / 2,
+              $"{fast.BytesRead / 1048576.0:F1} MB contro {full.BytesRead / 1048576.0:F1} MB");
+        Check("la durata è comunque plausibile", quick.Titles.Count > 0 && quick.Titles[0].Seconds > 1,
+              quick.Titles.Count > 0 ? $"{quick.Titles[0].Seconds:F1} s" : "");
+        Check("il titolo copre tutta l'area video",
+              quick.Titles.Count > 0 && quick.Titles[0].Bytes > 250L * 1024 * 1024,
+              quick.Titles.Count > 0 ? quick.Titles[0].SizeText : "");
+    }
+
+    private static void TestReadVolume()
+    {
+        Section("Quanto disco viene letto durante l'analisi");
+
+        foreach (var (file, description) in new[]
+                 {
+                     ("dvd.iso", "DVD con strutture di navigazione"),
+                     ("raw.bin", "disco piccolo senza filesystem"),
+                     ("raw_grande.bin", "disco grande senza filesystem")
+                 })
+        {
+            string path = Path.Combine(_media, file);
+            if (!File.Exists(path)) continue;
+
+            using var inner = new FileBlockSource(path);
+            using var counter = new CountingSource(inner);
+
+            var watch = Stopwatch.StartNew();
+            var result = RecoveryEngine.Analyze(counter, false, null, null, _ => { }, CancellationToken.None);
+            watch.Stop();
+
+            double totalMb = inner.Length / 1048576.0;
+            double readMb = counter.BytesRead / 1048576.0;
+            double ratio = readMb * 100.0 / totalMb;
+
+            Console.WriteLine($"  {description}: letti {readMb:F1} MB su {totalMb:F1} MB ({ratio:F0}%), " +
+                              $"{counter.Operations} richieste al supporto, " +
+                              $"{result.Titles.Count} titoli, {watch.ElapsedMilliseconds} ms");
+
+            if (file == "dvd.iso")
+            {
+                Check("con le strutture si legge una frazione del disco", ratio < 25, $"{ratio:F0}%");
+
+                // su un lettore ottico ogni richiesta costa 10-30 ms: contarle è più
+                // indicativo dei byte
+                Check("poche richieste al lettore grazie alla lettura anticipata",
+                      counter.Operations < 80, $"{counter.Operations} richieste");
+
+                // confronto diretto: la stessa analisi senza cache
+                using var plainInner = new FileBlockSource(path);
+                using var plainCounter = new CountingSource(plainInner);
+                var noCache = new CachingBlockSource(plainCounter) { ReadAheadBlocks = 1 };
+                RecoveryEngine.Analyze(noCache, false, null, null, _ => { }, CancellationToken.None);
+
+                Console.WriteLine($"    senza lettura anticipata sarebbero {plainCounter.Operations} richieste");
+                Check("la lettura anticipata riduce nettamente le richieste",
+                      counter.Operations < plainCounter.Operations,
+                      $"{counter.Operations} contro {plainCounter.Operations}");
+            }
+            else if (file == "raw.bin")
+            {
+                // tratto breve: leggere di seguito costa meno che saltare, quello che conta
+                // è che le richieste restino poche e grandi
+                Check("su un tratto breve si legge di seguito, con poche richieste",
+                      counter.Operations < 60, $"{counter.Operations} richieste");
+            }
+            else
+            {
+                // qui il campionamento serve davvero: il disco è grande e in mezzo è vuoto
+                Check("su un disco grande il campionamento evita di leggere tutto",
+                      ratio < 40, $"{ratio:F0}%");
+                Check("e lo fa senza riempire il lettore di salti",
+                      counter.Operations < 400, $"{counter.Operations} richieste");
+                Check("trova comunque le due registrazioni", result.Titles.Count == 2,
+                      $"{result.Titles.Count}");
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ nomi dei file
+
+    private static async Task TestFileNames()
+    {
+        Section("Nomi dei file prodotti");
+
+        string iso = Path.Combine(_media, "dvd.iso");
+        string ffmpeg = FindFfmpeg();
+        if (!File.Exists(iso) || ffmpeg == null) { Console.WriteLine("  (materiale assente, salto)"); return; }
+
+        using var source = new FileBlockSource(iso);
+        var result = RecoveryEngine.Analyze(source, false, null, null, _ => { }, CancellationToken.None);
+        var titles = RecoveryEngine.ApplySplit(result, SplitMode.SingleFile);
+        if (titles.Count == 0) { Check("nessun titolo", false); return; }
+
+        var runner = new FfmpegRunner(ffmpeg);
+
+        // caso tipico: solo il rimpacchettamento veloce
+        string dir1 = Path.Combine(_media, "nomi1");
+        if (Directory.Exists(dir1)) Directory.Delete(dir1, true);
+
+        var onlyRemux = new ExtractOptions
+        {
+            OutputFolder = dir1,
+            Split = SplitMode.SingleFile,
+            MakeH264 = false,
+            MakeRemux = true,
+            Crf = 30,
+            Preset = "ultrafast",
+            FileNamePrefix = "ripresa"
+        };
+
+        await TitleExtractor.ExtractAsync(source, titles[0], onlyRemux, runner, null, _ => { }, CancellationToken.None);
+
+        var produced = Directory.GetFiles(dir1).Select(Path.GetFileName).OrderBy(n => n).ToList();
+        Console.WriteLine($"  solo senza ricodifica: {string.Join(", ", produced)}");
+        Check("il file si chiama come il titolo, senza suffissi", produced.Contains("ripresa.mp4"),
+              string.Join(", ", produced));
+        Check("nessun file con _originale", !produced.Any(n => n.Contains("originale")));
+
+        // seconda estrazione nella stessa cartella: non deve sovrascrivere la prima
+        await TitleExtractor.ExtractAsync(source, titles[0], onlyRemux, runner, null, _ => { }, CancellationToken.None);
+        produced = Directory.GetFiles(dir1).Select(Path.GetFileName).OrderBy(n => n).ToList();
+        Console.WriteLine($"  dopo la seconda estrazione: {string.Join(", ", produced)}");
+        Check("la seconda estrazione non sovrascrive la prima", produced.Count == 2,
+              string.Join(", ", produced));
+
+        // entrambe le uscite: qui due nomi diversi servono per forza
+        string dir2 = Path.Combine(_media, "nomi2");
+        if (Directory.Exists(dir2)) Directory.Delete(dir2, true);
+
+        var both = new ExtractOptions
+        {
+            OutputFolder = dir2,
+            Split = SplitMode.SingleFile,
+            MakeH264 = true,
+            MakeRemux = true,
+            Crf = 30,
+            Preset = "ultrafast",
+            FileNamePrefix = "ripresa"
+        };
+
+        await TitleExtractor.ExtractAsync(source, titles[0], both, runner, null, _ => { }, CancellationToken.None);
+
+        produced = Directory.GetFiles(dir2).Select(Path.GetFileName).OrderBy(n => n).ToList();
+        Console.WriteLine($"  entrambe le uscite: {string.Join(", ", produced)}");
+        Check("l'MP4 ricodificato tiene il nome pulito", produced.Contains("ripresa.mp4"));
+        Check("il secondo file è distinguibile", produced.Count == 2, string.Join(", ", produced));
+    }
+
+    // -------------------------------------------------- impostazioni salvate
+
+    private static void TestSettings()
+    {
+        Section("Impostazioni conservate fra un avvio e l'altro");
+
+        string path = AppSettings.FilePath;
+        string backup = null;
+
+        if (File.Exists(path))
+        {
+            backup = path + ".bak";
+            File.Copy(path, backup, true);
+        }
+
+        try
+        {
+            var saved = new AppSettings
+            {
+                OutputFolder = @"\\server\condivisione\riprese",
+                WorkFolder = @"\\server\condivisione\immagini",
+                FileNamePrefix = "battesimo",
+                SplitMode = 1,
+                MakeH264 = false,
+                MakeRemux = true,
+                KeepRaw = true,
+                Deinterlace = false,
+                Crf = 18,
+                Preset = "slow",
+                ReadSpeed = 2,
+                ThoroughRecovery = true,
+                LastDrive = "E"
+            };
+
+            saved.Save();
+            Check("il file delle impostazioni viene creato", File.Exists(path), path);
+
+            var loaded = AppSettings.Load();
+
+            Check("il percorso di rete viene conservato",
+                  loaded.OutputFolder == @"\\server\condivisione\riprese", loaded.OutputFolder);
+            Check("il prefisso dei file viene conservato", loaded.FileNamePrefix == "battesimo");
+            Check("la modalità di divisione viene conservata", loaded.SplitMode == 1);
+            Check("le scelte di formato vengono conservate",
+                  !loaded.MakeH264 && loaded.MakeRemux && loaded.KeepRaw);
+            Check("qualità, preset e velocità vengono conservati",
+                  loaded.Crf == 18 && loaded.Preset == "slow" && loaded.ReadSpeed == 2);
+            Check("il lettore usato l'ultima volta viene conservato", loaded.LastDrive == "E");
+
+            // un file rovinato non deve impedire l'avvio
+            File.WriteAllText(path, "{ questo non è JSON");
+            var fallback = AppSettings.Load();
+            Check("un file danneggiato non blocca il programma", fallback != null && fallback.Crf == 20);
+        }
+        finally
+        {
+            try
+            {
+                if (backup != null) { File.Copy(backup, path, true); File.Delete(backup); }
+                else if (File.Exists(path)) File.Delete(path);
+            }
+            catch { }
+        }
     }
 
     // -------------------------------------------------------- dati sbagliati
@@ -262,7 +557,7 @@ internal static class Program
         try
         {
             using var source = new FileBlockSource(junk);
-            var result = RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
+            var result = RecoveryEngine.Analyze(source, false, null, null, _ => { }, CancellationToken.None);
             Check("nessuna eccezione su 8 MB di rumore", true, $"{result.Titles.Count} falsi titoli");
             Check("pochi o nessun falso positivo", result.Titles.Count <= 1, $"{result.Titles.Count}");
         }
@@ -276,7 +571,7 @@ internal static class Program
             string tiny = Path.Combine(_media, "minuscolo.bin");
             File.WriteAllBytes(tiny, new byte[1024]);
             using var source = new FileBlockSource(tiny);
-            RecoveryEngine.Analyze(source, false, null, _ => { }, CancellationToken.None);
+            RecoveryEngine.Analyze(source, false, null, null, _ => { }, CancellationToken.None);
             Check("nessuna eccezione su un file troncato", true);
         }
         catch (Exception ex)

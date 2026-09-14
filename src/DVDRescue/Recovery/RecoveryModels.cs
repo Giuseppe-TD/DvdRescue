@@ -103,6 +103,12 @@ public sealed class RecoveryResult
 
     /// <summary>True se il disco dichiara titoli/capitoli propri (IFO, playlist).</summary>
     public bool HasChapters;
+
+    /// <summary>
+    /// Analisi rapida: si è presa tutta l'area scritta senza cercare i confini fra le
+    /// registrazioni. Per separarle serve rileggere il disco.
+    /// </summary>
+    public bool QuickScan;
 }
 
 public sealed class ProgressReport

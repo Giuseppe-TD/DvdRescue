@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using DVDRescue.Core;
 
 namespace DVDRescue.Media;
@@ -19,11 +20,18 @@ public sealed class MediaSegment
 /// Serve quando filesystem e strutture di navigazione non ci sono più: ogni settore
 /// da 2048 byte che contiene video inizia con un pack header MPEG (00 00 01 BA).
 ///
-/// La divisione è volutamente prudente: su un DVD-Video l'orologio interno (SCR)
-/// riparte a ogni cella, quindi dividere sulle sue discontinuità produce decine di
-/// frammenti inutili. Qui si divide solo dove c'è una prova concreta di stacco:
-/// un buco lungo di settori non video. Il ritorno indietro dell'orologio conta solo
-/// se è accompagnato da un buco, oppure se lo si chiede esplicitamente.
+/// Due accorgimenti tengono bassi i tempi senza perdere niente per strada.
+///
+/// Il primo riguarda come ci si muove sul disco: un lettore ottico legge di seguito a una
+/// quindicina di megabyte al secondo, ma ogni salto gli costa una ricerca della testina,
+/// attorno al decimo di secondo. Assaggiare il disco a intervalli fissi sembra furbo e invece
+/// è il peggio dei due mondi: si riempie il lettore di salti e si rischia di non vedere una
+/// ripresa più corta dell'intervallo. Qui il video si legge sempre tutto di seguito, e si salta
+/// soltanto dentro il vuoto, dopo averne letto abbastanza da sapere che vuoto è davvero.
+///
+/// Il secondo riguarda come si divide: su un DVD-Video l'orologio interno riparte a ogni cella,
+/// quindi tagliare a ogni sua discontinuità produce decine di frammenti inutili. Si divide solo
+/// dove c'è una prova concreta di stacco, cioè un buco lungo di settori non video.
 /// </summary>
 public sealed class MpegPsCarver
 {
@@ -39,19 +47,42 @@ public sealed class MpegPsCarver
     /// <summary>Segmenti più corti di così vengono scartati.</summary>
     public long MinSegmentSectors { get; set; } = 128;  // 256 KB
 
-    private const int BlockSectors = 512;
+    /// <summary>Vuoto da leggere prima di cominciare a saltare in avanti.</summary>
+    public long GapBeforeSkipBytes { get; set; } = 2L << 20;
+
+    /// <summary>
+    /// Salto massimo dentro una zona vuota. È il compromesso che conta: un salto non può mai
+    /// scavalcare una registrazione più lunga di così, quindi con quattro megabyte si è certi
+    /// di non perdere nulla che duri più di quattro o cinque secondi. Chi vuole la certezza
+    /// assoluta disattiva i salti con <see cref="SkipEmptyAreas"/>.
+    /// </summary>
+    public long MaxSkipBytes { get; set; } = 4L << 20;
+
+    /// <summary>Disattiva i salti: legge tutto di seguito.</summary>
+    public bool SkipEmptyAreas { get; set; } = true;
+
+    private const int BlockSectors = 512;               // 1 MB per richiesta
 
     public List<MediaSegment> RejectedFragments { get; } = new();
+
+    /// <summary>Settori effettivamente letti durante l'ultima scansione.</summary>
+    public long SectorsRead { get; private set; }
+
+    /// <summary>Richieste inoltrate al supporto: su un lettore ottico ognuna costa una ricerca.</summary>
+    public long DeviceReads { get; private set; }
 
     public List<MediaSegment> Scan(IBlockSource source, long startByte, long endByte,
                                    IProgress<string> progress, CancellationToken ct)
     {
+        SectorsRead = 0;
+        DeviceReads = 0;
+
+        long startSector = Math.Max(0, startByte / 2048);
+        long endSector = Math.Min(endByte / 2048, source.Length / 2048 - 1);
+        if (endSector < startSector) return new List<MediaSegment>();
+
         var segments = new List<MediaSegment>();
         var buffer = new byte[BlockSectors * 2048];
-
-        long startSector = startByte / 2048;
-        long endSector = Math.Min(endByte / 2048, source.Length / 2048 - 1);
-        if (endSector < startSector) return segments;
 
         long segmentStart = -1, segmentEnd = -1;
         long gapRun = 0;
@@ -60,8 +91,13 @@ public sealed class MpegPsCarver
         bool havePreviousScr = false;
         double accumulated = 0;
 
-        var watch = System.Diagnostics.Stopwatch.StartNew();
-        long totalSectors = endSector - startSector + 1;
+        long gapBeforeSkip = Math.Max(BlockSectors, GapBeforeSkipBytes / 2048);
+        long maxSkip = Math.Max(BlockSectors, MaxSkipBytes / 2048);
+        long currentSkip = 0;
+        long skipStart = -1;
+
+        var watch = Stopwatch.StartNew();
+        long total = endSector - startSector + 1;
 
         void Close()
         {
@@ -86,12 +122,18 @@ public sealed class MpegPsCarver
             segmentHasGaps = false;
         }
 
-        for (long sector = startSector; sector <= endSector; sector += BlockSectors)
+        long sector = startSector;
+
+        while (sector <= endSector)
         {
             ct.ThrowIfCancellationRequested();
 
             int count = (int)Math.Min(BlockSectors, endSector - sector + 1);
-            source.ReadBytes(sector * 2048, count * 2048, buffer, 0);
+            source.ReadBlocks(sector, count, buffer, 0);
+            SectorsRead += count;
+            DeviceReads++;
+
+            bool anyVideo = false;
 
             for (int i = 0; i < count; i++)
             {
@@ -109,12 +151,18 @@ public sealed class MpegPsCarver
                     continue;
                 }
 
+                anyVideo = true;
                 gapRun = 0;
                 ulong scr = ReadScr(buffer, offset);
 
                 if (segmentStart < 0)
                 {
-                    segmentStart = current;
+                    // se si arriva da un salto, l'inizio vero può stare nella zona saltata
+                    long realStart = current;
+                    if (skipStart >= 0 && skipStart < current)
+                        realStart = FindFirstVideo(source, skipStart, current, ct);
+
+                    segmentStart = realStart;
                     accumulated = 0;
                     havePreviousScr = false;
                     segmentHasGaps = false;
@@ -123,14 +171,9 @@ public sealed class MpegPsCarver
                 {
                     long delta = (long)scr - (long)previousScr;
 
-                    if (delta >= 0 && delta < 90000 * 2)
-                    {
-                        accumulated += delta;
-                    }
+                    if (delta >= 0 && delta < 90000 * 2) accumulated += delta;
                     else if (SplitOnClockReset && delta < -(long)(ClockResetSeconds * 90000))
                     {
-                        // stacco richiesto esplicitamente dall'utente
-                        long previousEnd = segmentEnd;
                         Close();
                         segmentStart = current;
                         segmentEnd = current;
@@ -142,18 +185,79 @@ public sealed class MpegPsCarver
                 segmentEnd = current;
             }
 
+            if (source is Recovery.OpticalBlockSource optical && optical.ReachedEndOfData)
+            {
+                progress?.Report("Fine dell'area scritta raggiunta: interrompo la ricerca.");
+                break;
+            }
+
+            if (anyVideo)
+            {
+                // dentro il video non si salta mai
+                currentSkip = 0;
+                skipStart = -1;
+                sector += count;
+            }
+            else if (SkipEmptyAreas && gapRun >= gapBeforeSkip)
+            {
+                // solo l'ultimo tratto saltato va ricontrollato se dopo si trova del video:
+                // tutto quello prima è già stato letto e si sa che è vuoto
+                skipStart = sector + count;
+
+                currentSkip = currentSkip == 0
+                    ? BlockSectors * 2
+                    : Math.Min(currentSkip * 2, maxSkip);
+
+                gapRun += currentSkip;
+                if (segmentStart >= 0 && gapRun > MaxGapSectors) Close();
+
+                sector += count + currentSkip;
+            }
+            else
+            {
+                sector += count;
+            }
+
             if (progress != null && watch.ElapsedMilliseconds > 400)
             {
                 watch.Restart();
-                long done = sector + count - startSector;
-                double mb = done * 2048.0 / 1048576.0;
-                progress.Report($"Ricerca video: {mb:F0} MB analizzati, {segments.Count + (segmentStart >= 0 ? 1 : 0)} tratti");
+                long done = Math.Min(total, sector - startSector);
+                progress.Report($"Ricerca video: {done * 2048.0 / 1048576.0:F0} MB di " +
+                                $"{total * 2048.0 / 1048576.0:F0} MB, " +
+                                $"{SectorsRead * 2048.0 / 1048576.0:F0} MB letti, " +
+                                $"{segments.Count + (segmentStart >= 0 ? 1 : 0)} tratti");
             }
         }
 
         Close();
         return segments;
     }
+
+    /// <summary>
+    /// Torna indietro nella zona saltata per trovare il primo settore video: si legge di
+    /// seguito, che sul supporto ottico costa meno di una manciata di letture sparse.
+    /// </summary>
+    private long FindFirstVideo(IBlockSource source, long from, long to, CancellationToken ct)
+    {
+        var buffer = new byte[BlockSectors * 2048];
+
+        for (long sector = from; sector <= to; sector += BlockSectors)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            int count = (int)Math.Min(BlockSectors, to - sector + 1);
+            source.ReadBlocks(sector, count, buffer, 0);
+            SectorsRead += count;
+            DeviceReads++;
+
+            for (int i = 0; i < count; i++)
+                if (IsPackHeader(buffer, i * 2048)) return sector + i;
+        }
+
+        return to;
+    }
+
+    // ------------------------------------------------------------------ MPEG
 
     /// <summary>True se il settore inizia con un pack header MPEG valido.</summary>
     public static bool IsPackHeader(byte[] b, int o)
@@ -165,7 +269,6 @@ public sealed class MpegPsCarver
 
         if ((b4 & 0xC0) == 0x40)
         {
-            // MPEG-2: i marker bit eliminano quasi tutti i falsi riconoscimenti
             return (b[o + 4] & 0x04) != 0
                 && (b[o + 6] & 0x04) != 0
                 && (b[o + 8] & 0x04) != 0
@@ -199,32 +302,61 @@ public sealed class MpegPsCarver
              | ((ulong)b[o + 8] >> 1);
     }
 
-    /// <summary>Durata di un tratto già individuato, letta dagli orologi di inizio e fine.</summary>
+    /// <summary>
+    /// Durata di un tratto, ricavata dall'orologio interno dello stream.
+    ///
+    /// Ogni assaggio costa una ricerca della testina, quindi se ne fanno pochissimi: nel caso
+    /// normale bastano il primo e l'ultimo pack. Gli assaggi intermedi servono solo quando fra
+    /// i due l'orologio è ripartito, cosa che succede se il tratto contiene più registrazioni.
+    /// </summary>
     public static double MeasureSeconds(IBlockSource source, long startByte, long length)
     {
-        var buffer = new byte[2048];
-        double accumulated = 0;
-        ulong previous = 0;
-        bool have = false;
-
         long sectors = length / 2048;
-        long step = Math.Max(1, sectors / 4000);   // campionamento: basta per una stima solida
+        if (sectors <= 0) return 0;
 
-        for (long i = 0; i < sectors; i += step)
+        ulong? first = ScrAt(source, startByte, sectors, 0, forward: true);
+        ulong? last = ScrAt(source, startByte, sectors, sectors - 1, forward: false);
+
+        if (first.HasValue && last.HasValue)
         {
-            if (source.ReadBytes(startByte + i * 2048, 2048, buffer, 0) < 2048) break;
-            if (!IsPackHeader(buffer, 0)) continue;
+            long delta = (long)last.Value - (long)first.Value;
+            if (delta > 0 && delta < 90000L * 3600 * 12) return delta / 90000.0;
+        }
 
-            ulong scr = ReadScr(buffer, 0);
-            if (have)
+        // l'orologio è ripartito per strada: si somma a tratti, con una dozzina di assaggi
+        const int samples = 12;
+        double accumulated = 0;
+        ulong? previous = first;
+        long step = Math.Max(1, sectors / samples);
+
+        for (long i = step; i < sectors; i += step)
+        {
+            ulong? current = ScrAt(source, startByte, sectors, i, forward: true);
+            if (current.HasValue && previous.HasValue)
             {
-                long delta = (long)scr - (long)previous;
-                if (delta > 0 && delta < 90000L * 60 * 10) accumulated += delta;
+                long delta = (long)current.Value - (long)previous.Value;
+                if (delta > 0 && delta < 90000L * 3600) accumulated += delta;
             }
-            previous = scr;
-            have = true;
+            if (current.HasValue) previous = current;
         }
 
         return accumulated / 90000.0;
+    }
+
+    /// <summary>Orologio del primo pack valido a partire dal settore indicato.</summary>
+    private static ulong? ScrAt(IBlockSource source, long startByte, long sectors, long sector, bool forward)
+    {
+        var buffer = new byte[2048];
+
+        for (int attempt = 0; attempt < 8; attempt++)
+        {
+            long index = forward ? sector + attempt : sector - attempt;
+            if (index < 0 || index >= sectors) break;
+
+            if (source.ReadBytes(startByte + index * 2048, 2048, buffer, 0) < 2048) break;
+            if (IsPackHeader(buffer, 0)) return ReadScr(buffer, 0);
+        }
+
+        return null;
     }
 }

@@ -4,9 +4,17 @@ using DVDRescue.Native;
 namespace DVDRescue.Recovery;
 
 /// <summary>
-/// Espone un lettore ottico come sorgente di blocchi, con ritentativi a scalare:
-/// blocco grande → blocchi piccoli → settore singolo → settore azzerato e contato.
-/// Così un graffio non interrompe il recupero di tutto il resto.
+/// Espone un lettore ottico come sorgente di blocchi.
+///
+/// La velocità qui dipende quasi tutta da come ci si comporta sugli errori. Un lettore che
+/// riceve una richiesta su un'area non scritta ritenta per conto suo prima di rispondere:
+/// con un timeout generoso e tre tentativi per settore, poche migliaia di settori vuoti
+/// diventano minuti di attesa. Per questo il comportamento predefinito è "veloce":
+/// un tentativo, timeout corto, e su un blocco illeggibile si rinuncia in fretta invece di
+/// suddividerlo fino al singolo settore.
+///
+/// La modalità insistente serve solo ai dischi rovinati, dove ha senso spendere tempo per
+/// strappare al lettore qualche settore in più.
 /// </summary>
 public sealed class OpticalBlockSource : BlockSourceBase
 {
@@ -21,8 +29,22 @@ public sealed class OpticalBlockSource : BlockSourceBase
     public override long TotalBlocks => _totalBlocks;
     public override long BadBlockCount => _bad;
 
-    public int RetriesPerSector { get; set; } = 3;
-    public bool UseAlternateRead { get; set; } = true;
+    /// <summary>Ritentativi e suddivisione del blocco: lento ma recupera di più.</summary>
+    public bool ThoroughMode { get; set; }
+
+    /// <summary>Timeout di una lettura normale, in secondi.</summary>
+    public int ReadTimeout { get; set; } = 10;
+
+    /// <summary>Timeout dei sondaggi usati per trovare il limite dell'area scritta.</summary>
+    public int ProbeTimeout { get; set; } = 4;
+
+    /// <summary>Settori illeggibili di fila oltre i quali si considera finita l'area scritta.</summary>
+    public long ConsecutiveFailuresLimit { get; set; } = 8192;   // 16 MB
+
+    /// <summary>Vero quando il limite qui sopra è stato superato: chi scandisce può fermarsi.</summary>
+    public bool ReachedEndOfData { get; private set; }
+
+    public long ConsecutiveFailures { get; private set; }
     public List<long> BadSectors { get; } = new();
 
     public OpticalBlockSource(OpticalDrive drive, long totalBlocks, bool ownsDrive = true)
@@ -35,42 +57,83 @@ public sealed class OpticalBlockSource : BlockSourceBase
 
     public void SetTotalBlocks(long blocks) => _totalBlocks = blocks;
 
+    public void ResetEndOfData()
+    {
+        ReachedEndOfData = false;
+        ConsecutiveFailures = 0;
+    }
+
     public override int ReadBlocks(long block, int count, byte[] destination, int destinationOffset)
+        => ReadBlocks(block, count, destination, destinationOffset, 0);
+
+    private int ReadBlocks(long block, int count, byte[] destination, int destinationOffset, int depth)
     {
         if (count <= 0) return 0;
 
-        var result = _drive.ReadSectors(block, count, destination, destinationOffset);
-        if (result.Success) return count;
+        if (_drive.ReadSectors(block, count, destination, destinationOffset, ReadTimeout).Success)
+        {
+            ConsecutiveFailures = 0;
+            return count;
+        }
 
-        if (count == 1) return ReadOneWithRetry(block, destination, destinationOffset) ? 1 : 0;
+        if (count == 1) return ReadSingle(block, destination, destinationOffset) ? 1 : 0;
+
+        // In modalità veloce la suddivisione si ferma presto: un blocco da 512 settori
+        // tutto illeggibile costerebbe altrimenti più di mille comandi al lettore.
+        int maxDepth = ThoroughMode ? 12 : 2;
+
+        if (depth >= maxDepth)
+        {
+            Array.Clear(destination, destinationOffset, count * 2048);
+            RegisterFailure(block, count);
+            return 0;
+        }
 
         int half = count / 2;
-        int ok = ReadBlocks(block, half, destination, destinationOffset);
-        ok += ReadBlocks(block + half, count - half, destination, destinationOffset + half * 2048);
+        int ok = ReadBlocks(block, half, destination, destinationOffset, depth + 1);
+        ok += ReadBlocks(block + half, count - half, destination, destinationOffset + half * 2048, depth + 1);
         return ok;
     }
 
-    private bool ReadOneWithRetry(long block, byte[] destination, int destinationOffset)
+    private bool ReadSingle(long block, byte[] destination, int destinationOffset)
     {
-        for (int attempt = 0; attempt < RetriesPerSector; attempt++)
+        int attempts = ThoroughMode ? 3 : 1;
+
+        for (int attempt = 0; attempt < attempts; attempt++)
         {
-            if (_drive.ReadSectors(block, 1, destination, destinationOffset).Success) return true;
-            if (UseAlternateRead && _drive.ReadSectorsAlternate(block, 1, destination, destinationOffset).Success) return true;
-            Thread.Sleep(25);
+            if (_drive.ReadSectors(block, 1, destination, destinationOffset, ReadTimeout).Success)
+            {
+                ConsecutiveFailures = 0;
+                return true;
+            }
+
+            if (ThoroughMode &&
+                _drive.ReadSectorsAlternate(block, 1, destination, destinationOffset, ReadTimeout).Success)
+            {
+                ConsecutiveFailures = 0;
+                return true;
+            }
+
+            if (attempt + 1 < attempts) Thread.Sleep(20);
         }
 
         Array.Clear(destination, destinationOffset, 2048);
-        _bad++;
-        if (BadSectors.Count < 200000) BadSectors.Add(block);
+        RegisterFailure(block, 1);
         return false;
     }
 
-    /// <summary>Lettura secca senza ritentativi: serve a cercare il limite dell'area scritta.</summary>
-    public bool ProbeSector(long block)
+    private void RegisterFailure(long block, int count)
     {
-        if (_drive.ReadSectors(block, 1, _probe, 0).Success) return true;
-        return UseAlternateRead && _drive.ReadSectorsAlternate(block, 1, _probe, 0).Success;
+        _bad += count;
+        ConsecutiveFailures += count;
+
+        if (BadSectors.Count < 50000) BadSectors.Add(block);
+        if (ConsecutiveFailures >= ConsecutiveFailuresLimit) ReachedEndOfData = true;
     }
+
+    /// <summary>Lettura secca, timeout corto, nessun ritentativo: serve solo a sondare.</summary>
+    public bool ProbeSector(long block)
+        => _drive.ReadSectors(block, 1, _probe, 0, ProbeTimeout).Success;
 
     public override void Dispose()
     {

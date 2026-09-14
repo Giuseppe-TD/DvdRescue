@@ -13,6 +13,7 @@ partial class MainForm
     private Label lblSpeed;
     private ComboBox cmbSpeed;
     private CheckBox chkDeepScan;
+    private CheckBox chkThorough;
     private CheckBox chkSaveImage;
     private Label lblWorkFolder;
     private TextBox txtWorkFolder;
@@ -34,6 +35,7 @@ partial class MainForm
     private Label lblOutFolder;
     private TextBox txtOutFolder;
     private Button btnBrowseOut;
+    private Button btnNetwork;
     private Label lblSplit;
     private ComboBox cmbSplit;
     private Label lblPrefix;
@@ -72,6 +74,7 @@ partial class MainForm
         lblSpeed = new Label();
         cmbSpeed = new ComboBox();
         chkDeepScan = new CheckBox();
+        chkThorough = new CheckBox();
         chkSaveImage = new CheckBox();
         lblWorkFolder = new Label();
         txtWorkFolder = new TextBox();
@@ -93,6 +96,7 @@ partial class MainForm
         lblOutFolder = new Label();
         txtOutFolder = new TextBox();
         btnBrowseOut = new Button();
+        btnNetwork = new Button();
         lblSplit = new Label();
         cmbSplit = new ComboBox();
         lblPrefix = new Label();
@@ -160,9 +164,13 @@ partial class MainForm
         cmbSpeed.Items.AddRange(new object[] { "massima", "8x", "4x", "2x" });
         cmbSpeed.SelectedIndex = 0;
 
-        chkDeepScan.Text = "Ignora le strutture del disco e scandisci tutti i settori (più lento)";
-        chkDeepScan.Location = new Point(228, 58);
-        chkDeepScan.Size = new Size(420, 22);
+        chkDeepScan.Text = "Ignora le strutture e scandisci i settori";
+        chkDeepScan.Location = new Point(218, 58);
+        chkDeepScan.Size = new Size(280, 22);
+
+        chkThorough.Text = "Recupero insistente (dischi rovinati, molto più lento)";
+        chkThorough.Location = new Point(504, 58);
+        chkThorough.Size = new Size(340, 22);
 
         chkSaveImage.Text = "Salva anche una copia integrale del disco (.bin)";
         chkSaveImage.Location = new Point(14, 84);
@@ -192,7 +200,8 @@ partial class MainForm
         grpSource.Controls.AddRange(new Control[]
         {
             lblDrive, cmbDrives, btnRefreshDrives, btnOpenImage, btnRead,
-            lblSpeed, cmbSpeed, chkDeepScan, chkSaveImage, lblWorkFolder, txtWorkFolder, btnBrowseWork
+            lblSpeed, cmbSpeed, chkDeepScan, chkThorough, chkSaveImage,
+            lblWorkFolder, txtWorkFolder, btnBrowseWork
         });
 
         // ------------------------------------------------------------ titoli
@@ -249,12 +258,17 @@ partial class MainForm
         lblOutFolder.TextAlign = ContentAlignment.MiddleLeft;
 
         txtOutFolder.Location = new Point(78, 25);
-        txtOutFolder.Size = new Size(620, 23);
+        txtOutFolder.Size = new Size(566, 23);
 
         btnBrowseOut.Text = "...";
-        btnBrowseOut.Location = new Point(704, 24);
+        btnBrowseOut.Location = new Point(650, 24);
         btnBrowseOut.Size = new Size(38, 25);
         btnBrowseOut.Click += BtnBrowseOut_Click;
+
+        btnNetwork.Text = "Rete ▾";
+        btnNetwork.Location = new Point(694, 24);
+        btnNetwork.Size = new Size(64, 25);
+        btnNetwork.Click += BtnNetwork_Click;
 
         lblSplit.Text = "Divisione:";
         lblSplit.Location = new Point(14, 58);
@@ -339,7 +353,7 @@ partial class MainForm
 
         grpOutput.Controls.AddRange(new Control[]
         {
-            lblOutFolder, txtOutFolder, btnBrowseOut, lblSplit, cmbSplit, lblPrefix, txtPrefix,
+            lblOutFolder, txtOutFolder, btnBrowseOut, btnNetwork, lblSplit, cmbSplit, lblPrefix, txtPrefix,
             chkH264, chkRemux, chkKeepRaw, chkDeinterlace,
             lblQuality, numCrf, lblPreset, cmbPreset, btnExtract, btnCancel
         });

@@ -315,8 +315,13 @@ public sealed class OpticalDrive : IDisposable
 
     // --------------------------------------------------------------- comandi
 
-    /// <summary>READ(10) — lettura di settori dati da 2048 byte.</summary>
-    public ScsiResult ReadSectors(long lba, int count, byte[] destination, int destinationOffset)
+    /// <summary>
+    /// READ(10) — lettura di settori dati da 2048 byte.
+    /// Il timeout conta: su un'area non scritta il lettore ritenta per conto suo prima di
+    /// rispondere, quindi un valore alto trasforma qualche migliaio di settori vuoti in minuti.
+    /// </summary>
+    public ScsiResult ReadSectors(long lba, int count, byte[] destination, int destinationOffset,
+                                  int timeoutSeconds = 10)
     {
         if (count <= 0) return new ScsiResult { Success = true };
 
@@ -339,7 +344,7 @@ public sealed class OpticalDrive : IDisposable
             }
         }
 
-        var res = Execute(cdb, null, len, true, 30);
+        var res = Execute(cdb, null, len, true, timeoutSeconds);
         if (res.Success)
             lock (_lock) _buffer.CopyTo(destination, destinationOffset, len);
 
@@ -347,7 +352,8 @@ public sealed class OpticalDrive : IDisposable
     }
 
     /// <summary>READ CD (0xBE) in modalità dati: alcuni drive lo accettano dove READ(10) fallisce.</summary>
-    public ScsiResult ReadSectorsAlternate(long lba, int count, byte[] destination, int destinationOffset)
+    public ScsiResult ReadSectorsAlternate(long lba, int count, byte[] destination, int destinationOffset,
+                                           int timeoutSeconds = 10)
     {
         var cdb = new byte[12];
         cdb[0] = 0xBE;
@@ -371,7 +377,7 @@ public sealed class OpticalDrive : IDisposable
             }
         }
 
-        var res = Execute(cdb, null, len, true, 30);
+        var res = Execute(cdb, null, len, true, timeoutSeconds);
         if (res.Success)
             lock (_lock) _buffer.CopyTo(destination, destinationOffset, len);
 

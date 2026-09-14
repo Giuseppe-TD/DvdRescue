@@ -17,6 +17,7 @@ public partial class MainForm : Form
     private RecoveryResult _result;
     private string _ffmpegPath;
     private bool _busy;
+    private AppSettings _settings = new();
 
     private readonly ConcurrentQueue<string> _logQueue = new();
     private volatile ProgressReport _lastProgress;
@@ -47,10 +48,56 @@ public partial class MainForm : Form
         string videos = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
         if (string.IsNullOrEmpty(videos)) videos = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
 
-        txtOutFolder.Text = Path.Combine(videos, "DVDRescue");
-        txtWorkFolder.Text = Path.Combine(videos, "DVDRescue", "immagini");
+        _settings = AppSettings.Load();
+
+        txtOutFolder.Text = string.IsNullOrWhiteSpace(_settings.OutputFolder)
+            ? Path.Combine(videos, "DVDRescue")
+            : _settings.OutputFolder;
+
+        txtWorkFolder.Text = string.IsNullOrWhiteSpace(_settings.WorkFolder)
+            ? Path.Combine(videos, "DVDRescue", "immagini")
+            : _settings.WorkFolder;
+
+        txtPrefix.Text = _settings.FileNamePrefix;
+        cmbSplit.SelectedIndex = Math.Clamp(_settings.SplitMode, 0, cmbSplit.Items.Count - 1);
+        chkH264.Checked = _settings.MakeH264;
+        chkRemux.Checked = _settings.MakeRemux;
+        chkKeepRaw.Checked = _settings.KeepRaw;
+        chkDeinterlace.Checked = _settings.Deinterlace;
+        numCrf.Value = Math.Clamp(_settings.Crf, (int)numCrf.Minimum, (int)numCrf.Maximum);
+        cmbSpeed.SelectedIndex = Math.Clamp(_settings.ReadSpeed, 0, cmbSpeed.Items.Count - 1);
+        chkSaveImage.Checked = _settings.SaveDiscImage;
+        chkDeepScan.Checked = _settings.DeepScan;
+        chkThorough.Checked = _settings.ThoroughRecovery;
+
+        int preset = cmbPreset.Items.IndexOf(_settings.Preset ?? "");
+        cmbPreset.SelectedIndex = preset >= 0 ? preset : cmbPreset.Items.IndexOf("medium");
 
         RefreshDrives();
+
+        if (!string.IsNullOrWhiteSpace(_settings.LastDrive))
+        {
+            for (int i = 0; i < cmbDrives.Items.Count; i++)
+                if (cmbDrives.Items[i] is OpticalDriveEntry entry &&
+                    entry.Letter.Equals(_settings.LastDrive, StringComparison.OrdinalIgnoreCase))
+                {
+                    cmbDrives.SelectedIndex = i;
+                    break;
+                }
+        }
+
+        // versione in chiaro: serve a capire al volo quale build si sta usando
+        string version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "?";
+        string built = "";
+        try
+        {
+            var stamp = File.GetLastWriteTime(Environment.ProcessPath ?? "");
+            if (stamp.Year > 2000) built = $", build del {stamp:dd/MM/yyyy HH:mm}";
+        }
+        catch { }
+
+        Text = $"DVDRescue {version} — recupero video da DVD, miniDVD e Blu-ray";
+        Log($"DVDRescue {version}{built}");
 
         _ffmpegPath = FfmpegLocator.Find();
         Log(_ffmpegPath != null
@@ -58,6 +105,195 @@ public partial class MainForm : Form
             : "ffmpeg non trovato: verrà scaricato alla prima conversione.");
 
         Log("Inserisci il disco e premi \"Leggi disco\".");
+
+        RestoreNetworkDrivesAsync();
+    }
+
+    /// <summary>
+    /// Windows tiene separate le connessioni di rete fra sessione normale e sessione
+    /// amministratore: le lettere mappate dall'utente non esistono per un processo elevato come
+    /// questo, e quindi non compaiono nella finestra di scelta della cartella. Qui si rifanno.
+    /// </summary>
+    private async void RestoreNetworkDrivesAsync()
+    {
+        try
+        {
+            var mappings = await Task.Run(NetworkDrives.RestoreAll);
+
+            if (NetworkDrives.IsLinkedConnectionsEnabled())
+                Log("Windows è impostato per mostrare le unità di rete anche ai programmi amministratore.");
+
+            if (mappings.Count == 0) return;
+
+            var restored = mappings.Where(m => m.Restored).ToList();
+            var failed = mappings.Where(m => !m.Restored).ToList();
+
+            if (restored.Count > 0)
+                Log($"Unità di rete disponibili: {string.Join(", ", restored.Select(m => m.ToString()))}");
+
+            foreach (var mapping in failed)
+                Log($"Unità {mapping.Letter}: non ripristinata ({mapping.Problem}). " +
+                    "Usa il pulsante \"Rete...\" oppure scrivi il percorso per esteso.");
+        }
+        catch (Exception ex)
+        {
+            Log($"Ripristino delle unità di rete non riuscito: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Prepara la cartella di destinazione e restituisce il percorso da usare davvero.
+    ///
+    /// Una lettera di rete come Y: non esiste per un processo amministratore, ma il percorso
+    /// per esteso a cui punta funziona: quindi si traduce e si prosegue con quello. Se la
+    /// condivisione non risponde nemmeno così, si chiedono le credenziali a Windows.
+    /// </summary>
+    private string PrepareFolder(string folder)
+    {
+        folder = (folder ?? "").Trim();
+        if (folder.Length == 0) throw new IOException("Nessuna cartella di destinazione indicata.");
+
+        if (TryCreate(folder)) return folder;
+
+        // la lettera non è raggiungibile: si prova col percorso di rete per esteso
+        string unc = NetworkDrives.ResolveToUnc(folder);
+
+        if (!string.IsNullOrEmpty(unc))
+        {
+            Log($"{folder} non è raggiungibile da amministratore: uso {unc}");
+            if (TryCreate(unc)) return unc;
+        }
+
+        string target = unc ?? folder;
+
+        if (NetworkDrives.IsNetworkPath(target))
+        {
+            string share = NetworkDrives.GetShareRoot(target) ?? target;
+            Log($"Chiedo le credenziali per {share}.");
+
+            if (NetworkDrives.ConnectInteractively(Handle, share) && TryCreate(target))
+                return target;
+        }
+
+        throw new IOException(
+            $"Impossibile usare la cartella {folder}." +
+            (string.IsNullOrEmpty(unc) ? "" : $"\r\nProvato anche con {unc}.") +
+            "\r\n\r\nScrivi il percorso di rete per esteso (\\\\server\\condivisione\\cartella) " +
+            "oppure scegli una cartella locale.");
+    }
+
+    private static bool TryCreate(string folder)
+    {
+        try
+        {
+            Directory.CreateDirectory(folder);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    private void BtnNetwork_Click(object sender, EventArgs e)
+    {
+        var menu = new ContextMenuStrip();
+
+        menu.Items.Add("Connetti a una cartella di rete...", null, (s, args) => ConnectToShare());
+
+        bool linked = NetworkDrives.IsLinkedConnectionsEnabled();
+        var toggle = new ToolStripMenuItem(
+            linked
+                ? "Le unità di rete sono sempre visibili — disattiva"
+                : "Rendi le unità di rete sempre visibili (impostazione di Windows)",
+            null, (s, args) => ToggleLinkedConnections(!linked))
+        { Checked = linked };
+
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(toggle);
+        menu.Items.Add("Riprova a ripristinare le unità mappate", null, (s, args) => RestoreNetworkDrivesAsync());
+
+        menu.Show(btnNetwork, new Point(0, btnNetwork.Height));
+    }
+
+    private void ConnectToShare()
+    {
+        string path = txtOutFolder.Text.Trim();
+
+        if (!path.StartsWith(@"\\"))
+        {
+            MessageBox.Show(
+                "Scrivi prima il percorso della cartella di rete per esteso, " +
+                "per esempio \\\\server\\condivisione\\video, poi riapri questo menu " +
+                "per inserire le credenziali.",
+                "Cartella di rete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        // risale alla radice \\server\condivisione: è quella che vuole l'autenticazione
+        var parts = path.TrimStart('\\').Split('\\', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+        {
+            MessageBox.Show("Il percorso deve essere nella forma \\\\server\\condivisione\\...",
+                "Cartella di rete", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        string share = $@"\\{parts[0]}\{parts[1]}";
+
+        if (NetworkDrives.ConnectInteractively(Handle, share))
+        {
+            Log($"Connessione a {share} stabilita.");
+            MessageBox.Show($"Connesso a {share}.", "DVDRescue",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        else
+        {
+            Log($"Connessione a {share} non riuscita.");
+        }
+    }
+
+    /// <summary>
+    /// Attiva o disattiva EnableLinkedConnections. È una modifica al sistema, quindi si fa solo
+    /// con una conferma esplicita e si può sempre tornare indietro dallo stesso menu.
+    /// </summary>
+    private void ToggleLinkedConnections(bool enable)
+    {
+        string question = enable
+            ? "Windows terrà collegate le unità di rete fra sessione normale e sessione " +
+              "amministratore: le lettere mappate (Z:, Y:...) diventeranno visibili ai programmi " +
+              "avviati come amministratore.\r\n\r\n" +
+              "È un'impostazione di Windows, non di DVDRescue: vale per tutti i programmi e per " +
+              "tutti gli utenti di questo computer, e ha effetto dal prossimo riavvio.\r\n\r\n" +
+              "Si può annullare in qualunque momento da questo stesso menu.\r\n\r\n" +
+              "Procedo?"
+            : "Rimuovo l'impostazione e Windows torna a tenere separate le unità di rete delle " +
+              "due sessioni, com'era prima.\r\n\r\nHa effetto dal prossimo riavvio. Procedo?";
+
+        var answer = MessageBox.Show(question, "Impostazione di Windows",
+            MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+        if (answer != DialogResult.Yes) return;
+
+        try
+        {
+            NetworkDrives.SetLinkedConnections(enable);
+
+            Log(enable
+                ? "Impostazione attivata: dopo il riavvio le unità di rete saranno visibili anche da amministratore."
+                : "Impostazione rimossa: dopo il riavvio le unità di rete torneranno separate.");
+
+            MessageBox.Show(
+                (enable ? "Impostazione attivata." : "Impostazione rimossa.") +
+                "\r\n\r\nRiavvia il computer perché abbia effetto. Nel frattempo DVDRescue " +
+                "continua a ripristinare le unità per conto suo all'avvio.",
+                "DVDRescue", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            Log($"Impossibile modificare l'impostazione: {ex.Message}");
+            MessageBox.Show(
+                "Non è stato possibile modificare l'impostazione:\r\n\r\n" + ex.Message +
+                "\r\n\r\nServono i privilegi di amministratore.",
+                "DVDRescue", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
@@ -70,8 +306,36 @@ public partial class MainForm : Form
             _cts?.Cancel();
         }
 
+        SaveSettings();
         _uiTimer.Stop();
         ReleaseSource();
+    }
+
+    /// <summary>Conserva le scelte dell'utente: al prossimo avvio si riparte da dov'era.</summary>
+    private void SaveSettings()
+    {
+        try
+        {
+            _settings.OutputFolder = txtOutFolder.Text.Trim();
+            _settings.WorkFolder = txtWorkFolder.Text.Trim();
+            _settings.FileNamePrefix = txtPrefix.Text.Trim();
+            _settings.SplitMode = cmbSplit.SelectedIndex;
+            _settings.MakeH264 = chkH264.Checked;
+            _settings.MakeRemux = chkRemux.Checked;
+            _settings.KeepRaw = chkKeepRaw.Checked;
+            _settings.Deinterlace = chkDeinterlace.Checked;
+            _settings.Crf = (int)numCrf.Value;
+            _settings.Preset = cmbPreset.SelectedItem?.ToString() ?? "medium";
+            _settings.ReadSpeed = cmbSpeed.SelectedIndex;
+            _settings.SaveDiscImage = chkSaveImage.Checked;
+            _settings.DeepScan = chkDeepScan.Checked;
+            _settings.ThoroughRecovery = chkThorough.Checked;
+
+            if (cmbDrives.SelectedItem is OpticalDriveEntry entry) _settings.LastDrive = entry.Letter;
+
+            _settings.Save();
+        }
+        catch { /* non deve mai impedire la chiusura */ }
     }
 
     private void ReleaseSource()
@@ -147,16 +411,45 @@ public partial class MainForm : Form
 
     private void BtnBrowseWork_Click(object sender, EventArgs e)
     {
-        using var dialog = new FolderBrowserDialog { Description = "Dove salvare la copia del disco" };
-        if (Directory.Exists(txtWorkFolder.Text)) dialog.SelectedPath = txtWorkFolder.Text;
-        if (dialog.ShowDialog(this) == DialogResult.OK) txtWorkFolder.Text = dialog.SelectedPath;
+        string chosen = PickFolder("Dove salvare la copia del disco", txtWorkFolder.Text);
+        if (chosen != null) txtWorkFolder.Text = chosen;
     }
 
     private void BtnBrowseOut_Click(object sender, EventArgs e)
     {
-        using var dialog = new FolderBrowserDialog { Description = "Dove salvare i video" };
-        if (Directory.Exists(txtOutFolder.Text)) dialog.SelectedPath = txtOutFolder.Text;
-        if (dialog.ShowDialog(this) == DialogResult.OK) txtOutFolder.Text = dialog.SelectedPath;
+        string chosen = PickFolder("Dove salvare i video", txtOutFolder.Text);
+        if (chosen != null) txtOutFolder.Text = chosen;
+    }
+
+    /// <summary>
+    /// Finestra di scelta della cartella. Nella casella "Cartella:" in basso si può incollare
+    /// un percorso di rete per esteso (\\server\condivisione\...) anche quando la lettera
+    /// mappata non compare nell'albero.
+    /// </summary>
+    private string PickFolder(string description, string current)
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = description + " — puoi anche incollare un percorso di rete",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = true,
+            AutoUpgradeEnabled = true
+        };
+
+        current = (current ?? "").Trim();
+
+        if (Directory.Exists(current)) dialog.SelectedPath = current;
+        else
+        {
+            try
+            {
+                string parent = Path.GetDirectoryName(current);
+                if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent)) dialog.SelectedPath = parent;
+            }
+            catch { /* percorso non valido: si apre dove capita */ }
+        }
+
+        return dialog.ShowDialog(this) == DialogResult.OK ? dialog.SelectedPath : null;
     }
 
     private async void BtnOpenImage_Click(object sender, EventArgs e)
@@ -203,8 +496,9 @@ public partial class MainForm : Form
 
         try
         {
-            long lastWritten = -1;
+            Func<long> verifyLimit = null;
             string mediaText = "", statusText = "";
+            var watch = System.Diagnostics.Stopwatch.StartNew();
 
             if (imageFile != null)
             {
@@ -236,26 +530,38 @@ public partial class MainForm : Form
                     _ => 0
                 };
 
-                var opened = await Task.Run(() => DriveAccess.Open(entry.Letter, speed, Log, ct), ct);
+                bool thorough = chkThorough.Checked;
+                var opened = await Task.Run(() => DriveAccess.Open(entry.Letter, speed, thorough, Log, ct), ct);
                 _drive = opened.Drive;
                 _source = opened.Source;
-                lastWritten = opened.LastWrittenSector;
                 mediaText = opened.MediaText;
                 statusText = opened.DiscStatusText;
                 foreach (var note in opened.Notes) Log("Nota: " + note);
 
+                // la ricerca del limite dell'area scritta viene fatta solo se serve la scansione
+                verifyLimit = () =>
+                {
+                    long verified = DriveAccess.VerifyWrittenLimit(opened.Source, opened.EstimatedLastSector, Log, ct);
+                    if (verified > 0) opened.Source.SetTotalBlocks(verified + 1);
+                    opened.Source.ResetEndOfData();
+                    return verified;
+                };
+
                 if (chkSaveImage.Checked)
-                    await SaveDiscImageAsync(opened, ct);
+                {
+                    long limit = verifyLimit();
+                    await SaveDiscImageAsync(opened.Source, limit > 0 ? limit : opened.EstimatedLastSector, ct);
+                }
             }
 
             var source = _source;
             bool deep = chkDeepScan.Checked;
+            bool preciseSplit = cmbSplit.SelectedIndex != 0;   // serve solo se i file vanno separati
             var textProgress = CreateTextProgress();
 
             var result = await Task.Run(() =>
             {
-                var r = RecoveryEngine.Analyze(source, deep, textProgress, Log, ct);
-                r.LastWrittenSector = lastWritten;
+                var r = RecoveryEngine.Analyze(source, deep, verifyLimit, textProgress, Log, ct, preciseSplit);
                 r.MediaText = mediaText;
                 r.DiscStatusText = statusText;
                 return r;
@@ -264,6 +570,7 @@ public partial class MainForm : Form
             _result = result;
             foreach (var note in result.Notes) Log("· " + note);
 
+            Log($"Tempo totale dell'analisi: {watch.Elapsed.TotalSeconds:F1} s.");
             ShowTitles();
         }
         catch (OperationCanceledException)
@@ -286,17 +593,16 @@ public partial class MainForm : Form
         }
     }
 
-    private async Task SaveDiscImageAsync(DriveAccess.DriveOpenResult opened, CancellationToken ct)
+    private async Task SaveDiscImageAsync(OpticalBlockSource source, long lastSector, CancellationToken ct)
     {
-        string folder = txtWorkFolder.Text.Trim();
-        Directory.CreateDirectory(folder);
+        string folder = PrepareFolder(txtWorkFolder.Text);
+        if (folder != txtWorkFolder.Text.Trim()) txtWorkFolder.Text = folder;
 
         string path = Path.Combine(folder, $"disco_{DateTime.Now:yyyyMMdd_HHmmss}.bin");
         Log($"Copio il disco in {path}");
 
         var progress = CreateProgress();
-        var source = opened.Source;
-        long total = opened.LastWrittenSector + 1;
+        long total = lastSector + 1;
 
         await Task.Run(async () =>
         {
@@ -325,7 +631,7 @@ public partial class MainForm : Form
             }
         }, ct);
 
-        Log($"Copia completata ({opened.Source.BadBlockCount} settori illeggibili).");
+        Log($"Copia completata ({source.BadBlockCount} settori illeggibili).");
     }
 
     private void ShowTitles()
@@ -356,6 +662,10 @@ public partial class MainForm : Form
 
         if (mode == SplitMode.PerChapter && _result.ChapterTitles.Count == 0)
             Log("Questo disco non dichiara capitoli: resto sulla divisione per registrazione.");
+
+        if (mode != SplitMode.SingleFile && _result.QuickScan)
+            Log("Questa analisi ha preso l'area scritta tutta insieme: per separare le " +
+                "registrazioni premi di nuovo \"Leggi disco\" con questa divisione già scelta.");
 
         if (titles.Count == 0)
         {
@@ -411,7 +721,11 @@ public partial class MainForm : Form
 
         try
         {
-            Directory.CreateDirectory(options.OutputFolder);
+            // il percorso davvero utilizzabile può essere diverso da quello scritto
+            // (una lettera di rete diventa il percorso per esteso)
+            options.OutputFolder = PrepareFolder(options.OutputFolder);
+            if (options.OutputFolder != txtOutFolder.Text.Trim())
+                txtOutFolder.Text = options.OutputFolder;
 
             if ((options.MakeH264 || options.MakeRemux) && _ffmpegPath == null)
             {
@@ -450,6 +764,7 @@ public partial class MainForm : Form
             }
 
             Log($"Completato: {selected.Count} file in {options.OutputFolder}");
+            SaveSettings();
 
             if (MessageBox.Show("Fatto. Apro la cartella?", "DVDRescue",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)

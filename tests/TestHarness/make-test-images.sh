@@ -66,7 +66,23 @@ with open('raw.bin', 'wb') as out:
 print("raw.bin creato")
 PY
 
-echo "5/5 pulizia..."
+echo "5/6 costruisco un disco grande, per verificare il campionamento..."
+python3 - <<'PY'
+S = 2048
+a = open('t1.mpg', 'rb').read()
+b = open('t2.mpg', 'rb').read()
+# 300 MB: video all'inizio, un vuoto molto lungo, video in fondo.
+# Il file è sparso, quindi sul disco occupa solo i tratti scritti davvero.
+with open('raw_grande.bin', 'wb') as out:
+    out.write(b'\x00' * (16 * S))
+    out.write(a)
+    out.seek(260 * 1024 * 1024)
+    out.write(a)          # seconda registrazione: grande come una vera, non un francobollo
+    out.truncate(300 * 1024 * 1024)
+print("raw_grande.bin creato")
+PY
+
+echo "6/6 pulizia..."
 rm -rf dvd dvd2
 ls -lh dvd.iso dvd2.iso raw.bin
 

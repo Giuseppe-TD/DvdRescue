@@ -20,12 +20,36 @@ public static class TitleExtractor
     {
         Directory.CreateDirectory(options.OutputFolder);
 
-        string baseName = BuildBaseName(title, options);
-        string rawPath = Path.Combine(options.OutputFolder, baseName + title.RawExtension);
-        string h264Path = Path.Combine(options.OutputFolder, baseName + ".mp4");
-        string remuxPath = Path.Combine(options.OutputFolder, baseName + "_originale.mp4");
-
         bool wantsConversion = (options.MakeH264 || options.MakeRemux) && runner != null;
+        bool bothOutputs = wantsConversion && options.MakeH264 && options.MakeRemux;
+
+        // Nomi dei file: niente suffissi inutili. L'MP4 si chiama come il titolo, punto.
+        // Il suffisso compare solo quando si chiedono entrambe le uscite e servirebbero
+        // comunque due nomi diversi.
+        var extensions = new List<string>();
+        if (wantsConversion) extensions.Add(".mp4");
+        if (bothOutputs) extensions.Add("_originale.mp4");
+        if (options.KeepRaw || !wantsConversion) extensions.Add(title.RawExtension);
+
+        string baseName = MakeUniqueBaseName(options.OutputFolder, BuildBaseName(title, options), extensions);
+
+        string rawPath = Path.Combine(options.OutputFolder, baseName + title.RawExtension);
+        string h264Path = null, remuxPath = null;
+
+        if (bothOutputs)
+        {
+            h264Path = Path.Combine(options.OutputFolder, baseName + ".mp4");
+            remuxPath = Path.Combine(options.OutputFolder, baseName + "_originale.mp4");
+        }
+        else if (wantsConversion && options.MakeH264)
+        {
+            h264Path = Path.Combine(options.OutputFolder, baseName + ".mp4");
+        }
+        else if (wantsConversion && options.MakeRemux)
+        {
+            remuxPath = Path.Combine(options.OutputFolder, baseName + ".mp4");
+        }
+
         bool filterSectors = !title.IsTransportStream;   // il filtro pack header vale solo per i DVD
 
         // ---------------------------------------------------------- solo grezzo
@@ -36,9 +60,6 @@ public static class TitleExtractor
             return rawPath;
         }
 
-        string h264 = options.MakeH264 ? h264Path : null;
-        string remux = options.MakeRemux ? remuxPath : null;
-
         // -------------------------------------------- grezzo + conversione da file
         if (options.KeepRaw)
         {
@@ -46,16 +67,17 @@ public static class TitleExtractor
             log($"  flusso salvato: {written / 1048576.0:F0} MB in {Path.GetFileName(rawPath)}");
 
             string args = FfmpegRunner.BuildArgs(rawPath, title.IsTransportStream, title.PacketSize,
-                                                 h264, remux, options);
+                                                 h264Path, remuxPath, options);
             int code = await runner.RunAsync(args, null, title.Seconds, "Conversione", progress, log, ct);
-            log(code == 0 ? "  conversione completata." : $"  ffmpeg ha restituito {code}.");
-            return h264 ?? remux ?? rawPath;
+            log(code == 0
+                ? $"  creato {Path.GetFileName(h264Path ?? remuxPath)}"
+                : $"  ffmpeg ha restituito {code}.");
+            return h264Path ?? remuxPath ?? rawPath;
         }
 
         // ---------------------------------------------- conversione al volo da disco
         using var stream = new RangeStream(source, title.Ranges, filterSectors, ct);
 
-        // avanzamento della lettura: ffmpeg riporta il tempo elaborato, questo riporta i byte letti
         using var timer = new System.Threading.Timer(_ =>
         {
             double mb = stream.BytesRead / 1048576.0;
@@ -69,7 +91,7 @@ public static class TitleExtractor
         }, null, 1000, 1000);
 
         string pipeArgs = FfmpegRunner.BuildArgs("pipe:0", title.IsTransportStream, title.PacketSize,
-                                                 h264, remux, options);
+                                                 h264Path, remuxPath, options);
 
         int exit = await runner.RunAsync(pipeArgs, stream, title.Seconds, "Conversione al volo",
                                          progress, log, ct);
@@ -77,8 +99,11 @@ public static class TitleExtractor
         if (stream.SkippedSectors > 0)
             log($"  {stream.SkippedSectors} settori illeggibili o vuoti scartati durante la lettura.");
 
-        log(exit == 0 ? "  conversione completata." : $"  ffmpeg ha restituito {exit}.");
-        return h264 ?? remux;
+        log(exit == 0
+            ? $"  creato {Path.GetFileName(h264Path ?? remuxPath)}"
+            : $"  ffmpeg ha restituito {exit}.");
+
+        return h264Path ?? remuxPath;
     }
 
     private static async Task<long> WriteRawAsync(IBlockSource source, RecoveryTitle title, string path,
@@ -129,5 +154,32 @@ public static class TitleExtractor
             name += "_" + title.Recorded.Value.ToString("yyyy-MM-dd_HHmm");
 
         return ByteUtils.SafeFileName(name, prefix);
+    }
+
+    /// <summary>
+    /// Evita di sovrascrivere estrazioni precedenti: con "tutto in un unico file" il nome
+    /// dipende solo dal prefisso, quindi due dischi di fila finirebbero sullo stesso file.
+    /// </summary>
+    private static string MakeUniqueBaseName(string folder, string baseName, List<string> extensions)
+    {
+        if (extensions.Count == 0) return baseName;
+
+        bool Taken(string candidate)
+        {
+            foreach (var extension in extensions)
+                if (File.Exists(Path.Combine(folder, candidate + extension)))
+                    return true;
+            return false;
+        }
+
+        if (!Taken(baseName)) return baseName;
+
+        for (int i = 2; i < 1000; i++)
+        {
+            string candidate = $"{baseName}_{i}";
+            if (!Taken(candidate)) return candidate;
+        }
+
+        return baseName + "_" + DateTime.Now.ToString("HHmmss");
     }
 }
