@@ -86,8 +86,16 @@ public partial class MainForm : Form
                 }
         }
 
-        // versione in chiaro: serve a capire al volo quale build si sta usando
-        string version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "?";
+        // Versione in chiaro: serve a capire al volo quale build si sta usando.
+        // Si preferisce quella "informativa", che sulle build automatiche porta anche il numero
+        // di esecuzione (1.2.0-build.42) e distingue due compilazioni della stessa versione.
+        var assembly = Assembly.GetExecutingAssembly();
+        string version = assembly
+            .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion;
+
+        if (string.IsNullOrWhiteSpace(version) || version.Contains('+'))
+            version = assembly.GetName().Version?.ToString(3) ?? "?";
         string built = "";
         try
         {
