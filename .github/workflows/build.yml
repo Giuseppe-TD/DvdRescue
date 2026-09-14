@@ -54,14 +54,28 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Versione dal tag
+      - name: Versione
         id: ver
         shell: pwsh
         run: |
+          # Su un tag comanda il tag; altrimenti si prende quella dichiarata nel progetto,
+          # così una build da branch non si spaccia per 1.0.0 e si capisce cosa si sta usando.
           $tag = "${{ github.ref_name }}"
-          if ($tag -match '^v(\d+\.\d+\.\d+)') { $v = $Matches[1] } else { $v = "1.0.0" }
+
+          if ($tag -match '^v(\d+\.\d+\.\d+)') {
+            $v = $Matches[1]
+            $label = $v
+          }
+          else {
+            [xml]$proj = Get-Content "${{ env.PROJECT }}"
+            $v = ($proj.Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1)
+            if (-not $v) { $v = "1.0.0" }
+            $label = "$v-build.${{ github.run_number }}"
+          }
+
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Versione: $v"
+          "label=$label" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Versione: $v (etichetta: $label)"
 
       - name: Restore
         run: dotnet restore ${{ env.PROJECT }} -r win-x64
@@ -79,6 +93,7 @@ jobs:
           -p:Version=${{ steps.ver.outputs.version }}
           -p:FileVersion=${{ steps.ver.outputs.version }}.0
           -p:AssemblyVersion=${{ steps.ver.outputs.version }}.0
+          -p:InformationalVersion=${{ steps.ver.outputs.label }}
           -o publish
 
       - name: Scarica ffmpeg
