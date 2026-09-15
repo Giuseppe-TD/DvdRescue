@@ -36,6 +36,7 @@ internal static class Program
         await TestSingleFileExtraction();
         await TestStreamingConversion();
         TestRawDisc();
+        TestDurationWithClockResets();
         TestVideoNotAtStart();
         TestReadVolume();
         TestQuickScan();
@@ -334,6 +335,32 @@ internal static class Program
         Check("il titolo copre tutta l'area video",
               quick.Titles.Count > 0 && quick.Titles[0].Bytes > 250L * 1024 * 1024,
               quick.Titles.Count > 0 ? quick.Titles[0].SizeText : "");
+    }
+
+    private static void TestDurationWithClockResets()
+    {
+        Section("Durata di un tratto con più registrazioni dentro");
+
+        string raw = Path.Combine(_media, "out", "unito.mpg");
+        if (!File.Exists(raw)) { Console.WriteLine("  (unito.mpg assente, salto)"); return; }
+
+        using var source = new FileBlockSource(raw);
+        double measured = MpegPsCarver.MeasureSeconds(source, 0, source.Length);
+
+        // il file contiene tre registrazioni in fila: l'orologio riparte due volte,
+        // e l'ultima dura solo sette secondi
+        double declared = Probe(raw);
+        long frames = ProbeFrames(raw);
+        double real = frames / 25.0;
+
+        Console.WriteLine($"  durata reale (dai fotogrammi): {real:F1} s");
+        Console.WriteLine($"  durata dichiarata dal flusso:  {declared:F1} s  <- quello che dava il vecchio calcolo");
+        Console.WriteLine($"  durata misurata da DVDRescue:  {measured:F1} s");
+
+        Check("non si ferma alla sola ultima registrazione", measured > declared * 2,
+              $"{measured:F1} contro {declared:F1}");
+        Check("la durata è vicina a quella vera", Math.Abs(measured - real) < real * 0.25,
+              $"{measured:F1} contro {real:F1}");
     }
 
     private static void TestVideoNotAtStart()

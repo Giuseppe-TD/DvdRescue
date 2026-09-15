@@ -303,40 +303,93 @@ public sealed class MpegPsCarver
     }
 
     /// <summary>
-    /// Durata di un tratto, ricavata dall'orologio interno dello stream.
+    /// Durata di un tratto.
     ///
-    /// Ogni assaggio costa una ricerca della testina, quindi se ne fanno pochissimi: nel caso
-    /// normale bastano il primo e l'ultimo pack. Gli assaggi intermedi servono solo quando fra
-    /// i due l'orologio è ripartito, cosa che succede se il tratto contiene più registrazioni.
+    /// Sottrarre il primo orologio dall'ultimo sembra la via più diretta e invece è sbagliata:
+    /// l'orologio dello stream riparte da capo a ogni registrazione, quindi su un disco con più
+    /// riprese quella differenza misura solo l'ultima — mezz'ora di video può risultare di
+    /// cinque secondi.
+    ///
+    /// Qui si misura invece il ritmo: in qualche punto sparso si guarda quanto orologio passa
+    /// fra due letture vicine, e da quel ritmo si ricava la durata dell'intero tratto. Un reset
+    /// in mezzo rovina al più il singolo punto, che viene scartato; la mediana degli altri regge.
+    /// Costa una manciata di letture ed è insensibile a quanti reset ci siano.
     /// </summary>
     public static double MeasureSeconds(IBlockSource source, long startByte, long length)
     {
         long sectors = length / 2048;
         if (sectors <= 0) return 0;
 
-        ulong? first = ScrAt(source, startByte, sectors, 0, forward: true);
-        ulong? last = ScrAt(source, startByte, sectors, sectors - 1, forward: false);
+        const int segments = 24;
+        long segmentSectors = sectors / segments;
 
-        if (first.HasValue && last.HasValue)
+        // tratto troppo corto per essere diviso: ci si accontenta della somma degli assaggi
+        if (segmentSectors < 64) return SumOfSegments(source, startByte, sectors);
+
+        // Il ritmo va misurato pezzo per pezzo, non una volta sola: su un disco il numero di
+        // byte al secondo cambia parecchio: una ripresa ferma su un muro occupa pochissimo,
+        // una piena di movimento molto di più. Un ritmo unico applicato a tutto sbaglia di brutto.
+        var rates = new double?[segments];
+        var measured = new List<double>();
+
+        for (int s = 0; s < segments; s++)
         {
-            long delta = (long)last.Value - (long)first.Value;
-            if (delta > 0 && delta < 90000L * 3600 * 12) return delta / 90000.0;
+            long from = s * segmentSectors;
+            long span = Math.Min(512, segmentSectors / 2);
+            if (span < 8) break;
+
+            ulong? a = ScrAt(source, startByte, sectors, from, forward: true);
+            ulong? b = ScrAt(source, startByte, sectors, from + span, forward: true);
+            if (!a.HasValue || !b.HasValue) continue;
+
+            long delta = (long)b.Value - (long)a.Value;
+
+            // se l'orologio è ripartito proprio qui il pezzo non è misurabile: lo si stimerà
+            // col ritmo degli altri
+            if (delta <= 0 || delta > 90000L * 120) continue;
+
+            double rate = delta / 90000.0 / span;
+            rates[s] = rate;
+            measured.Add(rate);
         }
 
-        // l'orologio è ripartito per strada: si somma a tratti, con una dozzina di assaggi
-        const int samples = 12;
+        if (measured.Count == 0) return SumOfSegments(source, startByte, sectors);
+
+        measured.Sort();
+        double fallback = measured[measured.Count / 2];
+
+        double total = 0;
+        for (int s = 0; s < segments; s++)
+        {
+            long length2 = s == segments - 1 ? sectors - s * segmentSectors : segmentSectors;
+            total += (rates[s] ?? fallback) * length2;
+        }
+
+        return total;
+    }
+
+    /// <summary>
+    /// Somma degli intervalli fra assaggi consecutivi, scartando quelli in cui l'orologio è
+    /// ripartito. È un limite inferiore: quello che si perde sono i tratti a cavallo di un reset.
+    /// </summary>
+    private static double SumOfSegments(IBlockSource source, long startByte, long sectors)
+    {
+        const int samples = 16;
         double accumulated = 0;
-        ulong? previous = first;
         long step = Math.Max(1, sectors / samples);
+
+        ulong? previous = ScrAt(source, startByte, sectors, 0, forward: true);
 
         for (long i = step; i < sectors; i += step)
         {
             ulong? current = ScrAt(source, startByte, sectors, i, forward: true);
+
             if (current.HasValue && previous.HasValue)
             {
                 long delta = (long)current.Value - (long)previous.Value;
                 if (delta > 0 && delta < 90000L * 3600) accumulated += delta;
             }
+
             if (current.HasValue) previous = current;
         }
 

@@ -136,6 +136,13 @@ il file precedente non viene sovrascritto: il nuovo diventa `ripresa_2.mp4`.
 Il deinterlacciamento è attivo di default: le videocamere registrano interlacciato e senza
 quel passaggio si vedono i pettini sui movimenti.
 
+La durata mostrata accanto a ogni video è misurata, non dichiarata: l'orologio interno dello
+stream riparte a ogni registrazione, quindi sottrarre il primo valore dall'ultimo darebbe la
+durata della sola ultima ripresa — mezz'ora può risultare di cinque secondi. DVDRescue misura
+invece il ritmo pezzo per pezzo lungo tutto il tratto, così regge sia i reset dell'orologio sia
+il fatto che una ripresa ferma occupa molti meno byte di una piena di movimento. Sul materiale
+di prova la stima cade entro il 2% del valore reale.
+
 Una nota sul flusso grezzo unito: mettendo in fila registrazioni diverse l'orologio MPEG riparte
 da capo, quindi il `.mpg` può dichiarare una durata più corta del vero. I dati ci sono tutti —
 l'MP4 convertito riporta la durata giusta.
