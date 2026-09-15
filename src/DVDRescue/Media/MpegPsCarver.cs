@@ -302,114 +302,165 @@ public sealed class MpegPsCarver
              | ((ulong)b[o + 8] >> 1);
     }
 
+    /// <summary>Settori sotto i quali la durata si misura leggendo tutto: esatto e costa poco.</summary>
+    private const long ExactMeasureSectors = 4096;     // 8 MB
+
+    private const int MeasureWindows = 16;
+
     /// <summary>
     /// Durata di un tratto.
     ///
-    /// Sottrarre il primo orologio dall'ultimo sembra la via più diretta e invece è sbagliata:
-    /// l'orologio dello stream riparte da capo a ogni registrazione, quindi su un disco con più
-    /// riprese quella differenza misura solo l'ultima — mezz'ora di video può risultare di
-    /// cinque secondi.
+    /// Tre trappole, e ci sono cascato in tutte e tre prima di arrivare qui.
     ///
-    /// Qui si misura invece il ritmo: in qualche punto sparso si guarda quanto orologio passa
-    /// fra due letture vicine, e da quel ritmo si ricava la durata dell'intero tratto. Un reset
-    /// in mezzo rovina al più il singolo punto, che viene scartato; la mediana degli altri regge.
-    /// Costa una manciata di letture ed è insensibile a quanti reset ci siano.
+    /// La prima: sottrarre il primo orologio dall'ultimo sembra la via diretta ed è sbagliata,
+    /// perché l'orologio dello stream riparte da capo a ogni registrazione. Su un disco di
+    /// famiglia con venti riprese quella differenza misura solo l'ultima: mezz'ora di video
+    /// diventa cinque secondi.
+    ///
+    /// La seconda: nemmeno un ritmo unico (secondi per settore) applicato a tutto il tratto
+    /// funziona, perché i byte al secondo cambiano parecchio — una ripresa ferma su un muro
+    /// occupa pochissimo, una piena di movimento molto di più. Il ritmo va misurato pezzo
+    /// per pezzo.
+    ///
+    /// La terza, la più insidiosa: un tratto non è tutto video. In modalità file unico si prende
+    /// l'intera area scritta, e se in mezzo ci sono megabyte vuoti — un DVD-RW con registrazioni
+    /// cancellate, un disco riempito a metà — contarli al ritmo del video gonfia la durata di
+    /// nove volte. Per questo di ogni assaggio si misura anche <i>quanto</i> è video.
+    ///
+    /// L'assaggio è una lettura da un megabyte, non una manciata di settori sparsi: su un lettore
+    /// ottico un megabyte di seguito costa meno di otto letture in giro per il disco, e in cambio
+    /// dà sia il ritmo sia la densità di video, contati esattamente.
     /// </summary>
     public static double MeasureSeconds(IBlockSource source, long startByte, long length)
+        => MeasureSeconds(source, startByte, length, out _);
+
+    /// <param name="videoDensity">
+    /// Frazione del tratto che contiene davvero video, fra 0 e 1. Serve a chi ha preso un tratto
+    /// largo sperando fosse tutto pieno: se torna bassa, quel tratto ha dei buchi dentro e
+    /// conviene cercarne i confini invece di fidarsi.
+    /// </param>
+    /// <inheritdoc cref="MeasureSeconds(IBlockSource, long, long)"/>
+    public static double MeasureSeconds(IBlockSource source, long startByte, long length,
+                                        out double videoDensity)
     {
+        videoDensity = 0;
+
         long sectors = length / 2048;
         if (sectors <= 0) return 0;
 
-        const int segments = 24;
-        long segmentSectors = sectors / segments;
+        // tratto piccolo: leggerlo tutto costa quanto assaggiarlo, e il risultato è esatto
+        if (sectors <= ExactMeasureSectors) return MeasureExact(source, startByte, sectors, out videoDensity);
 
-        // tratto troppo corto per essere diviso: ci si accontenta della somma degli assaggi
-        if (segmentSectors < 64) return SumOfSegments(source, startByte, sectors);
+        long segment = sectors / MeasureWindows;
 
-        // Il ritmo va misurato pezzo per pezzo, non una volta sola: su un disco il numero di
-        // byte al secondo cambia parecchio: una ripresa ferma su un muro occupa pochissimo,
-        // una piena di movimento molto di più. Un ritmo unico applicato a tutto sbaglia di brutto.
-        var rates = new double?[segments];
+        // L'assaggio è proporzionato al tratto: su un tratto piccolo non ha senso leggerne
+        // un megabyte per volta, finirebbe per leggerlo tutto due volte.
+        int windowSectors = (int)Math.Clamp(sectors / 64, 64, 512);
+
+        var buffer = new byte[windowSectors * 2048];
+        var rates = new double?[MeasureWindows];
+        var densities = new double[MeasureWindows];
         var measured = new List<double>();
 
-        for (int s = 0; s < segments; s++)
+        for (int w = 0; w < MeasureWindows; w++)
         {
-            long from = s * segmentSectors;
-            long span = Math.Min(512, segmentSectors / 2);
-            if (span < 8) break;
+            long from = w * segment;
+            int count = (int)Math.Min(windowSectors, sectors - from);
+            if (count <= 0) break;
 
-            ulong? a = ScrAt(source, startByte, sectors, from, forward: true);
-            ulong? b = ScrAt(source, startByte, sectors, from + span, forward: true);
-            if (!a.HasValue || !b.HasValue) continue;
+            Array.Clear(buffer, 0, count * 2048);
+            source.ReadBytes(startByte + from * 2048, count * 2048, buffer, 0);
 
-            long delta = (long)b.Value - (long)a.Value;
+            int video = 0, first = -1, last = -1;
 
-            // se l'orologio è ripartito proprio qui il pezzo non è misurabile: lo si stimerà
+            for (int i = 0; i < count; i++)
+                if (IsPackHeader(buffer, i * 2048))
+                {
+                    video++;
+                    if (first < 0) first = i;
+                    last = i;
+                }
+
+            densities[w] = (double)video / count;
+            if (video < 2) continue;
+
+            long delta = (long)ReadScr(buffer, last * 2048) - (long)ReadScr(buffer, first * 2048);
+
+            // orologio ripartito dentro l'assaggio: il pezzo non è misurabile, lo si stimerà
             // col ritmo degli altri
             if (delta <= 0 || delta > 90000L * 120) continue;
 
-            double rate = delta / 90000.0 / span;
-            rates[s] = rate;
+            double rate = delta / 90000.0 / (video - 1);    // secondi per settore di video
+            rates[w] = rate;
             measured.Add(rate);
         }
 
-        if (measured.Count == 0) return SumOfSegments(source, startByte, sectors);
+        double weighted = 0, spanned = 0;
+
+        for (int w = 0; w < MeasureWindows; w++)
+        {
+            long span = w == MeasureWindows - 1 ? sectors - w * segment : segment;
+            weighted += span * densities[w];
+            spanned += span;
+        }
+
+        videoDensity = spanned > 0 ? weighted / spanned : 0;
+
+        if (measured.Count == 0) return 0;
 
         measured.Sort();
         double fallback = measured[measured.Count / 2];
 
         double total = 0;
-        for (int s = 0; s < segments; s++)
+
+        for (int w = 0; w < MeasureWindows; w++)
         {
-            long length2 = s == segments - 1 ? sectors - s * segmentSectors : segmentSectors;
-            total += (rates[s] ?? fallback) * length2;
+            long span = w == MeasureWindows - 1 ? sectors - w * segment : segment;
+            total += (rates[w] ?? fallback) * span * densities[w];
         }
 
         return total;
     }
 
     /// <summary>
-    /// Somma degli intervalli fra assaggi consecutivi, scartando quelli in cui l'orologio è
-    /// ripartito. È un limite inferiore: quello che si perde sono i tratti a cavallo di un reset.
+    /// Durata esatta: si legge tutto di seguito e si sommano gli scatti d'orologio fra settori
+    /// video consecutivi, saltando i punti in cui riparte. I settori non video non contano.
     /// </summary>
-    private static double SumOfSegments(IBlockSource source, long startByte, long sectors)
+    private static double MeasureExact(IBlockSource source, long startByte, long sectors,
+                                       out double videoDensity)
     {
-        const int samples = 16;
+        var buffer = new byte[BlockSectors * 2048];
         double accumulated = 0;
-        long step = Math.Max(1, sectors / samples);
+        long video = 0;
+        ulong previous = 0;
+        bool havePrevious = false;
 
-        ulong? previous = ScrAt(source, startByte, sectors, 0, forward: true);
-
-        for (long i = step; i < sectors; i += step)
+        for (long sector = 0; sector < sectors; sector += BlockSectors)
         {
-            ulong? current = ScrAt(source, startByte, sectors, i, forward: true);
+            int count = (int)Math.Min(BlockSectors, sectors - sector);
 
-            if (current.HasValue && previous.HasValue)
+            Array.Clear(buffer, 0, count * 2048);
+            source.ReadBytes(startByte + sector * 2048, count * 2048, buffer, 0);
+
+            for (int i = 0; i < count; i++)
             {
-                long delta = (long)current.Value - (long)previous.Value;
-                if (delta > 0 && delta < 90000L * 3600) accumulated += delta;
+                if (!IsPackHeader(buffer, i * 2048)) continue;
+
+                video++;
+                ulong scr = ReadScr(buffer, i * 2048);
+
+                if (havePrevious)
+                {
+                    long delta = (long)scr - (long)previous;
+                    if (delta > 0 && delta < 90000L * 2) accumulated += delta;
+                }
+
+                previous = scr;
+                havePrevious = true;
             }
-
-            if (current.HasValue) previous = current;
         }
 
+        videoDensity = sectors > 0 ? (double)video / sectors : 0;
         return accumulated / 90000.0;
-    }
-
-    /// <summary>Orologio del primo pack valido a partire dal settore indicato.</summary>
-    private static ulong? ScrAt(IBlockSource source, long startByte, long sectors, long sector, bool forward)
-    {
-        var buffer = new byte[2048];
-
-        for (int attempt = 0; attempt < 8; attempt++)
-        {
-            long index = forward ? sector + attempt : sector - attempt;
-            if (index < 0 || index >= sectors) break;
-
-            if (source.ReadBytes(startByte + index * 2048, 2048, buffer, 0) < 2048) break;
-            if (IsPackHeader(buffer, 0)) return ReadScr(buffer, 0);
-        }
-
-        return null;
     }
 }

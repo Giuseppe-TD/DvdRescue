@@ -61,6 +61,10 @@ public static class DriveAccess
                 }
             }
 
+            // Quanto grande può essere una richiesta. Va stabilito subito, perché è il numero
+            // che decide se il disco verrà letto a megabyte o a due chilobyte alla volta.
+            drive.CalibrateTransferSize(log);
+
             var info = drive.ReadDiscInformation();
             if (info != null)
             {
@@ -113,7 +117,7 @@ public static class DriveAccess
 
             var source = new OpticalBlockSource(drive, lastSector + 1, ownsDrive: false)
             {
-                ThoroughMode = thorough
+                Effort = thorough ? ReadEffort.Thorough : ReadEffort.Fast
             };
 
             result.Source = source;

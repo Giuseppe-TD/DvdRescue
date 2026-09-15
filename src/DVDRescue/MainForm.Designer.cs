@@ -168,7 +168,7 @@ partial class MainForm
         chkDeepScan.Location = new Point(218, 58);
         chkDeepScan.Size = new Size(280, 22);
 
-        chkThorough.Text = "Recupero insistente (dischi rovinati, molto più lento)";
+        chkThorough.Text = "Parti subito col recupero insistente (di solito non serve: ci arriva da solo)";
         chkThorough.Location = new Point(504, 58);
         chkThorough.Size = new Size(340, 22);
 

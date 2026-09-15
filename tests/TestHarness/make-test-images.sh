@@ -94,9 +94,21 @@ with open('raw_offset.bin', 'wb') as out:
 print("raw_offset.bin creato")
 PY
 
-echo "7/7 pulizia..."
+echo "7/8 costruisco una registrazione lunga e continua, come una cassetta di famiglia..."
+python3 - <<'PY'
+a = open('t1.mpg', 'rb').read()
+# Dieci riprese da 20 s una dietro l'altra, senza buchi: è il caso vero di un DVD di
+# videocamera. L'orologio MPEG riparte a ogni ripresa, quindi la durata NON si può
+# ricavare sottraendo il primo orologio dall'ultimo: serve misurare il ritmo.
+with open('lungo.bin', 'wb') as out:
+    for _ in range(10):
+        out.write(a)
+print(f"lungo.bin creato: 10 riprese da 20 s = 200 s reali")
+PY
+
+echo "8/8 pulizia..."
 rm -rf dvd dvd2
-ls -lh dvd.iso dvd2.iso raw.bin
+ls -lh dvd.iso dvd2.iso raw.bin lungo.bin
 
 echo
 echo "Pronto. Ora:  dotnet run --project ../TestHarness.csproj -c Release"

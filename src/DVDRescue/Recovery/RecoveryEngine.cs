@@ -25,10 +25,15 @@ public static class RecoveryEngine
     /// Vero quando all'utente servono le registrazioni separate: allora i confini vanno cercati
     /// davvero. Falso quando vuole un file unico, e si può prendere tutta l'area scritta.
     /// </param>
+    /// <param name="allowQuickScan">
+    /// Falso per andare dritti alla ricerca completa. Serve ai tentativi successivi al primo:
+    /// il sondaggio rapido è già stato fatto e non ha trovato niente, rifarlo è tempo buttato.
+    /// </param>
     public static RecoveryResult Analyze(IBlockSource source, bool forceDeepScan,
                                          Func<long> verifyWrittenLimit,
                                          IProgress<string> progress, Action<string> log,
-                                         CancellationToken ct, bool preciseSplit = true)
+                                         CancellationToken ct, bool preciseSplit = true,
+                                         bool allowQuickScan = true)
     {
         log ??= _ => { };
         var result = new RecoveryResult { Source = source };
@@ -39,11 +44,12 @@ public static class RecoveryEngine
         // ricerca della testina. Le letture grandi le passano attraverso senza essere toccate.
         var cached = source as CachingBlockSource ?? new CachingBlockSource(source);
 
-        // durante il riconoscimento si sonda anche fuori dall'area scritta: meglio non
-        // restare appesi trenta secondi su un settore che non esiste
+        // Riconoscimento e sondaggi sono esplorazione: si sta cercando dove stanno i dati,
+        // non li si sta ancora recuperando. Qui si sonda anche fuori dall'area scritta, e
+        // insistere su settori che non esistono costa minuti senza dare niente in cambio.
         var optical = Unwrap(source) as OpticalBlockSource;
-        int previousTimeout = optical?.ReadTimeout ?? 0;
-        if (optical != null) optical.ReadTimeout = Math.Min(previousTimeout, 5);
+        bool previousExploring = optical?.Exploring ?? false;
+        if (optical != null) optical.Exploring = true;
 
         try
         {
@@ -65,29 +71,29 @@ public static class RecoveryEngine
                 case DiscProfile.DvdVideo:
                 case DiscProfile.DvdPartial:
                     if (!BuildFromDvdVideo(cached, result, log, ct))
-                        BuildFromScan(source, result, verifyWrittenLimit, forceDeepScan, preciseSplit, log, progress, ct);
+                        BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, log, progress, ct);
                     break;
 
                 case DiscProfile.DvdVr:
-                    if (!BuildFromDvdVr(cached, result, log, ct))
-                        BuildFromScan(source, result, verifyWrittenLimit, forceDeepScan, preciseSplit, log, progress, ct);
+                    if (!BuildFromDvdVr(cached, optical, result, log, ct))
+                        BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, log, progress, ct);
                     break;
 
                 case DiscProfile.Bdmv:
                 case DiscProfile.Bdav:
                 case DiscProfile.Avchd:
                     if (!BuildFromBluray(cached, result, log, ct))
-                        BuildFromScan(source, result, verifyWrittenLimit, forceDeepScan, preciseSplit, log, progress, ct);
+                        BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, log, progress, ct);
                     break;
 
                 default:
-                    BuildFromScan(source, result, verifyWrittenLimit, forceDeepScan, preciseSplit, log, progress, ct);
+                    BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, log, progress, ct);
                     break;
             }
         }
         finally
         {
-            if (optical != null) optical.ReadTimeout = previousTimeout;
+            if (optical != null) optical.Exploring = previousExploring;
         }
 
         log($"Analisi completata in {watch.Elapsed.TotalSeconds:F1} s " +
@@ -307,7 +313,8 @@ public static class RecoveryEngine
 
     // ---------------------------------------------------------------- DVD-VR
 
-    private static bool BuildFromDvdVr(IBlockSource source, RecoveryResult result,
+    private static bool BuildFromDvdVr(IBlockSource source, OpticalBlockSource optical,
+                                       RecoveryResult result,
                                        Action<string> log, CancellationToken ct)
     {
         var ifo = result.Files.FirstOrDefault(f => f.Key.EndsWith("VR_MANGR.IFO", StringComparison.OrdinalIgnoreCase));
@@ -368,8 +375,10 @@ public static class RecoveryEngine
             }
         }
 
-        // ripiego: il VRO si analizza da solo
+        // Ripiego: il VRO si analizza da solo. Qui non si esplora più, si legge il video vero,
+        // quindi torna in vigore l'impegno richiesto.
         log("Analizzo direttamente VR_MOVIE.VRO.");
+        if (optical != null) optical.Exploring = false;
         var carver = new MpegPsCarver();
         var segments = carver.Scan(source, vroStart, vroStart + vroLength, null, ct);
 
@@ -439,8 +448,9 @@ public static class RecoveryEngine
 
     // ------------------------------------------------------ scansione settori
 
-    private static void BuildFromScan(IBlockSource source, RecoveryResult result,
+    private static void BuildFromScan(IBlockSource source, OpticalBlockSource optical, RecoveryResult result,
                                       Func<long> verifyWrittenLimit, bool forceDeepScan, bool preciseSplit,
+                                      bool allowQuickScan,
                                       Action<string> log, IProgress<string> progress, CancellationToken ct)
     {
         long start = 0;
@@ -479,11 +489,15 @@ public static class RecoveryEngine
             // Se all'utente serve un file solo, i confini fra una registrazione e l'altra non
             // interessano: si prende tutta l'area scritta e si misura la durata con due letture,
             // invece di passare in rassegna un gigabyte alla velocità del lettore.
-            if (!preciseSplit && TryQuickScan(source, result, start, end, log))
+            if (!preciseSplit && allowQuickScan && TryQuickScan(source, optical, result, start, end, log, ct))
                 return;
 
             log($"Ricerca degli stream video fino al settore {end / 2048 - 1}...");
         }
+
+        // Da qui in poi non si esplora più, si recupera: torna in vigore l'impegno richiesto
+        // e il timeout pieno, perché ogni settore strappato al lettore è video in più.
+        if (optical != null) optical.Exploring = false;
 
         // Program Stream (DVD). Con la scansione approfondita si rinuncia anche ai salti
         // dentro le zone vuote: più lento, ma non può sfuggire nemmeno una clip di un secondo.
@@ -548,76 +562,97 @@ public static class RecoveryEngine
     /// quando l'uscita richiesta è un file unico — i settori inutili vengono comunque scartati
     /// durante l'estrazione.
     /// </summary>
-    private static bool TryQuickScan(IBlockSource source, RecoveryResult result,
-                                     long startByte, long endByte, Action<string> log)
+    private static bool TryQuickScan(IBlockSource source, OpticalBlockSource optical, RecoveryResult result,
+                                     long startByte, long endByte, Action<string> log, CancellationToken ct)
     {
-        const int window = 512;   // 1 MB
+        const int window = 512;   // 1 MB per lettura
         long lastSector = endByte / 2048 - 1;
         long firstSector = startByte / 2048;
         if (lastSector <= firstSector) return false;
 
         var buffer = new byte[window * 2048];
 
-        // Primo settore video. Non sempre comincia subito: su un disco formattato in modalità VR
-        // la testa del disco è occupata da strutture e riserve, e il video parte anche decine di
-        // megabyte più avanti. Quindi si assaggia a salti per un buon tratto, e quando si trova
-        // qualcosa si torna indietro a cercare il punto esatto.
-        long start = -1;
-        long probeStep = window * 8;                                   // un assaggio ogni 8 MB
-        long probeLimit = Math.Min(lastSector, firstSector + window * 128);   // fino a 256 MB
-        long foundAt = -1;
+        // Un settore solo prima di chiedere il megabyte. Se quello non risponde è quasi certo
+        // che non risponda nemmeno il resto, e insistere su un megabyte di vuoto vuol dire
+        // centinaia di comandi buttati: è esattamente quello che faceva aspettare minuti.
+        bool Readable(long sector) => optical == null || optical.ProbeSector(sector);
 
-        for (long sector = firstSector; sector < probeLimit && foundAt < 0; sector += probeStep)
+        long FirstVideoIn(long sector, int count)
         {
-            int count = (int)Math.Min(window, lastSector - sector + 1);
-            if (count <= 0) break;
+            if (count <= 0 || !Readable(sector)) return -1;
 
             source.ReadBlocks(sector, count, buffer, 0);
 
             for (int i = 0; i < count; i++)
-                if (MpegPsCarver.IsPackHeader(buffer, i * 2048)) { foundAt = sector + i; break; }
+                if (MpegPsCarver.IsPackHeader(buffer, i * 2048)) return sector + i;
+
+            return -1;
+        }
+
+        // ------------------------------------------------------------- inizio del video
+        // Non sempre comincia subito: su un disco formattato in modalità VR la testa è occupata
+        // da strutture e riserve, e il video parte anche parecchio più avanti. I primi megabyte
+        // si leggono quindi di seguito, così una ripresa breve in testa non sfugge; poi si
+        // assaggia a salti fino in fondo all'area scritta, invece di arrendersi a metà disco.
+        long probeStep = window * 8;                          // un assaggio ogni 8 MB
+        long contiguousUntil = firstSector + window * 16;     // primi 16 MB letti di seguito
+        long foundAt = -1;
+        long step = window;
+        long sector = firstSector;
+
+        while (sector <= lastSector && foundAt < 0)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            int count = (int)Math.Min(window, lastSector - sector + 1);
+            if (count <= 0) break;
+
+            foundAt = FirstVideoIn(sector, count);
+
+            sector += step;
+            if (sector >= contiguousUntil) step = probeStep;
         }
 
         if (foundAt < 0)
         {
-            log("Nessun video nei primi megabyte: passo alla ricerca completa.");
+            log("Il sondaggio rapido non ha trovato video: passo alla ricerca completa.");
             return false;
         }
 
-        // ritorno indietro per il punto esatto di inizio
-        start = foundAt;
+        // ritorno indietro per il punto esatto di inizio: il salto può aver scavalcato la testa
+        long start = foundAt;
         long backFrom = Math.Max(firstSector, foundAt - probeStep);
 
-        for (long sector = backFrom; sector < foundAt; sector += window)
+        for (long s = backFrom; s < foundAt; s += window)
         {
-            int count = (int)Math.Min(window, foundAt - sector);
-            if (count <= 0) break;
+            ct.ThrowIfCancellationRequested();
 
-            source.ReadBlocks(sector, count, buffer, 0);
-
-            bool found = false;
-            for (int i = 0; i < count; i++)
-                if (MpegPsCarver.IsPackHeader(buffer, i * 2048)) { start = sector + i; found = true; break; }
-
-            if (found) break;
+            int count = (int)Math.Min(window, foundAt - s);
+            long hit = FirstVideoIn(s, count);
+            if (hit >= 0) { start = hit; break; }
         }
 
-        // ultimo settore video, cercato a ritroso dalla fine dell'area scritta.
-        // Su un disco non finalizzato il video finisce dove finisce la scrittura, quindi
-        // di norma basta una lettura; il limite evita di risalire all'infinito se in coda
-        // c'è una zona vuota lunga.
+        // ------------------------------------------------------------- fine del video
+        // Cercata a ritroso dall'ultimo settore scritto: su un disco non finalizzato il video
+        // finisce dove finisce la scrittura, quindi di norma basta una lettura. Il limite evita
+        // di risalire all'infinito se in coda c'è una zona vuota lunga.
         long end = -1;
         long backwardLimit = Math.Max(start, lastSector - window * 32);
 
-        for (long sector = Math.Max(start, lastSector - window + 1); sector > backwardLimit; sector -= window)
+        for (long s = Math.Max(start, lastSector - window + 1); s > backwardLimit; s -= window)
         {
-            int count = (int)Math.Min(window, lastSector - sector + 1);
+            ct.ThrowIfCancellationRequested();
+
+            int count = (int)Math.Min(window, lastSector - s + 1);
             if (count <= 0) break;
 
-            source.ReadBlocks(sector, count, buffer, 0);
+            if (Readable(s))
+            {
+                source.ReadBlocks(s, count, buffer, 0);
 
-            for (int i = count - 1; i >= 0; i--)
-                if (MpegPsCarver.IsPackHeader(buffer, i * 2048)) { end = sector + i; break; }
+                for (int i = count - 1; i >= 0; i--)
+                    if (MpegPsCarver.IsPackHeader(buffer, i * 2048)) { end = s + i; break; }
+            }
 
             if (end >= 0) break;
         }
@@ -626,7 +661,19 @@ public static class RecoveryEngine
         if (end <= start) return false;
 
         long length = (end - start + 1) * 2048L;
-        double seconds = MpegPsCarver.MeasureSeconds(source, start * 2048L, length);
+        double seconds = MpegPsCarver.MeasureSeconds(source, start * 2048L, length, out double density);
+
+        // La lettura rapida si regge su un'assunzione: fra il primo e l'ultimo settore video c'è
+        // video, non buchi. Sui dischi di famiglia è vera, ma su un DVD-RW con registrazioni
+        // cancellate no — e lì prendere tutto il tratto come un blocco unico darebbe una durata
+        // sbagliata di parecchie volte. Se l'assunzione non regge si lascia perdere la
+        // scorciatoia e si cercano i confini davvero.
+        if (density < 0.5)
+        {
+            log($"Fra il primo e l'ultimo video il disco è pieno solo al {density * 100:F0}%: " +
+                "ci sono zone vuote in mezzo, quindi cerco i confini veri invece di tirare a indovinare.");
+            return false;
+        }
 
         result.Titles.Add(new RecoveryTitle
         {
@@ -638,7 +685,7 @@ public static class RecoveryEngine
 
         result.QuickScan = true;
         log($"Area video: settori {start}–{end}, {length / 1048576.0:F0} MB, " +
-            $"durata {TimeSpan.FromSeconds(seconds):hh\\:mm\\:ss}.");
+            $"pieno al {density * 100:F0}%, durata {TimeSpan.FromSeconds(seconds):hh\\:mm\\:ss}.");
         log("Lettura rapida: per separare le singole registrazioni scegli un'altra divisione e rileggi il disco.");
 
         return true;

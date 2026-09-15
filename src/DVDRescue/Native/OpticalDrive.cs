@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using DVDRescue.Core;
 using Microsoft.Win32.SafeHandles;
 
 namespace DVDRescue.Native;
@@ -97,7 +98,7 @@ public sealed class DvdPhysicalInfo
 /// È il meccanismo che permette di leggere i dischi che Windows non riesce a montare
 /// perché non finalizzati.
 /// </summary>
-public sealed class OpticalDrive : IDisposable
+public sealed class OpticalDrive : ISectorReader, IDisposable
 {
     public const int SectorSize = 2048;
 
@@ -116,6 +117,24 @@ public sealed class OpticalDrive : IDisposable
 
     /// <summary>True se l'unità è stata aperta come device fisico invece che per lettera.</summary>
     public bool OpenedAsPhysicalDevice { get; private set; }
+
+    /// <summary>
+    /// Settori che il lettore accetta in un solo comando.
+    ///
+    /// È il numero più importante di tutto il programma. Il pass-through SCSI di Windows passa
+    /// per l'adattatore, che ha un tetto sui byte trasferibili in una volta: su parecchi lettori
+    /// USB e ATAPI sono 64 KB, cioè 32 settori. Una richiesta più grande non viene "letta male",
+    /// viene rifiutata di netto — con il disco perfettamente sano. Chi non lo sa interpreta quel
+    /// rifiuto come un settore rovinato, si mette a spezzare il blocco fino al singolo settore e
+    /// finisce per leggere tutto il disco 2 KB alla volta: funziona, e ci mette un'eternità.
+    ///
+    /// Il valore viene ricavato dal driver e poi verificato leggendo davvero, perché il tetto
+    /// dichiarato non sempre coincide con quello vero.
+    /// </summary>
+    public int MaxSectorsPerRead { get; private set; } = 32;   // 64 KB: il minimo che accettano tutti
+
+    /// <summary>Descrizione leggibile di com'è stato deciso <see cref="MaxSectorsPerRead"/>.</summary>
+    public string TransferSizeInfo { get; private set; } = "non calibrato";
 
     /// <param name="driveLetter">Lettera di unità, es. "D" oppure "D:".</param>
     public static OpticalDrive Open(string driveLetter)
@@ -315,13 +334,131 @@ public sealed class OpticalDrive : IDisposable
 
     // --------------------------------------------------------------- comandi
 
+    // ------------------------------------------------- dimensione dei trasferimenti
+
+    /// <summary>
+    /// Stabilisce quanti settori chiedere per volta: prima si domanda all'adattatore, poi si
+    /// prova sul serio, perché il tetto dichiarato e quello vero non sempre coincidono.
+    /// Costa una manciata di comandi e fa risparmiare ore.
+    /// </summary>
+    public void CalibrateTransferSize(Action<string> log)
+    {
+        log ??= _ => { };
+
+        int declaredBytes = QueryAdapterMaxTransfer();
+        int ceiling = declaredBytes > 0 ? Math.Min(declaredBytes / SectorSize, 128) : 128;
+        if (ceiling < 1) ceiling = 1;
+
+        long reference = FindReadableSector();
+
+        if (reference < 0)
+        {
+            // niente di leggibile a portata di mano: ci si fida di quello che dice il driver,
+            // tenendosi bassi
+            MaxSectorsPerRead = declaredBytes > 0 ? Math.Max(1, Math.Min(declaredBytes / SectorSize, 128)) : 32;
+            TransferSizeInfo = declaredBytes > 0
+                ? $"{MaxSectorsPerRead} settori ({MaxSectorsPerRead * 2} KB), dichiarati dal driver"
+                : $"{MaxSectorsPerRead} settori ({MaxSectorsPerRead * 2} KB), valore prudenziale";
+            log($"Trasferimento massimo: {TransferSizeInfo}.");
+            return;
+        }
+
+        var buffer = new byte[128 * SectorSize];
+        int chosen = 0;
+
+        foreach (int candidate in new[] { 128, 64, 32, 16, 8, 4, 2, 1 })
+        {
+            if (candidate > ceiling) continue;
+            if (ReadSectorsRaw(reference, candidate, buffer, 0, 3).Success) { chosen = candidate; break; }
+        }
+
+        MaxSectorsPerRead = chosen > 0 ? chosen : 1;
+        TransferSizeInfo = $"{MaxSectorsPerRead} settori ({MaxSectorsPerRead * 2} KB), verificati sul lettore" +
+                           (declaredBytes > 0 ? $"; il driver ne dichiarava {declaredBytes / 1024} KB" : "");
+
+        log($"Trasferimento massimo: {TransferSizeInfo}.");
+    }
+
+    /// <summary>Primo settore leggibile fra alcuni punti tipici: serve solo come banco di prova.</summary>
+    private long FindReadableSector()
+    {
+        var one = new byte[SectorSize];
+        foreach (long lba in new long[] { 0, 16, 256, 1024, 4096 })
+            if (ReadSectorsRaw(lba, 1, one, 0, 3).Success) return lba;
+        return -1;
+    }
+
+    /// <summary>Byte massimi per comando secondo l'adattatore, 0 se non risponde.</summary>
+    private int QueryAdapterMaxTransfer()
+    {
+        IntPtr input = Marshal.AllocHGlobal(12);
+        IntPtr output = Marshal.AllocHGlobal(128);
+
+        try
+        {
+            Marshal.WriteInt32(input, 0, NativeMethods.StorageAdapterProperty);
+            Marshal.WriteInt32(input, 4, NativeMethods.PropertyStandardQuery);
+            Marshal.WriteInt32(input, 8, 0);
+            for (int i = 0; i < 128; i += 4) Marshal.WriteInt32(output, i, 0);
+
+            bool ok = NativeMethods.DeviceIoControl(_handle, NativeMethods.IOCTL_STORAGE_QUERY_PROPERTY,
+                                                    input, 12, output, 128, out uint returned, IntPtr.Zero);
+            if (!ok || returned < 16) return 0;
+
+            // STORAGE_ADAPTER_DESCRIPTOR: Version, Size, MaximumTransferLength, MaximumPhysicalPages
+            int maxTransfer = Marshal.ReadInt32(output, 8);
+            int maxPages = Marshal.ReadInt32(output, 12);
+
+            // il buffer non è allineato alla pagina, quindi una pagina se ne va comunque persa
+            if (maxPages > 1)
+            {
+                long byPages = (long)(maxPages - 1) * 4096;
+                if (byPages > 0 && byPages < maxTransfer) maxTransfer = (int)byPages;
+            }
+
+            return maxTransfer > 0 ? maxTransfer : 0;
+        }
+        catch { return 0; }
+        finally
+        {
+            Marshal.FreeHGlobal(input);
+            Marshal.FreeHGlobal(output);
+        }
+    }
+
     /// <summary>
     /// READ(10) — lettura di settori dati da 2048 byte.
+    ///
+    /// Le richieste più grandi di quello che l'adattatore accetta vengono spezzate qui: sono
+    /// letture consecutive, quindi al lettore non costano niente, e in cambio un rifiuto del
+    /// driver non viene più scambiato per un disco rovinato.
+    ///
     /// Il timeout conta: su un'area non scritta il lettore ritenta per conto suo prima di
     /// rispondere, quindi un valore alto trasforma qualche migliaio di settori vuoti in minuti.
     /// </summary>
     public ScsiResult ReadSectors(long lba, int count, byte[] destination, int destinationOffset,
                                   int timeoutSeconds = 10)
+    {
+        if (count <= 0) return new ScsiResult { Success = true };
+
+        int max = Math.Max(1, MaxSectorsPerRead);
+        if (count <= max) return ReadSectorsRaw(lba, count, destination, destinationOffset, timeoutSeconds);
+
+        ScsiResult last = null;
+
+        for (int done = 0; done < count; done += max)
+        {
+            int n = Math.Min(max, count - done);
+            last = ReadSectorsRaw(lba + done, n, destination, destinationOffset + done * SectorSize, timeoutSeconds);
+            if (!last.Success) return last;
+        }
+
+        return last;
+    }
+
+    /// <summary>Un solo comando READ(10), senza spezzare: la usa la calibrazione.</summary>
+    private ScsiResult ReadSectorsRaw(long lba, int count, byte[] destination, int destinationOffset,
+                                      int timeoutSeconds)
     {
         if (count <= 0) return new ScsiResult { Success = true };
 
@@ -354,6 +491,26 @@ public sealed class OpticalDrive : IDisposable
     /// <summary>READ CD (0xBE) in modalità dati: alcuni drive lo accettano dove READ(10) fallisce.</summary>
     public ScsiResult ReadSectorsAlternate(long lba, int count, byte[] destination, int destinationOffset,
                                            int timeoutSeconds = 10)
+    {
+        if (count <= 0) return new ScsiResult { Success = true };
+
+        int max = Math.Max(1, MaxSectorsPerRead);
+        if (count <= max) return ReadAlternateRaw(lba, count, destination, destinationOffset, timeoutSeconds);
+
+        ScsiResult last = null;
+
+        for (int done = 0; done < count; done += max)
+        {
+            int n = Math.Min(max, count - done);
+            last = ReadAlternateRaw(lba + done, n, destination, destinationOffset + done * SectorSize, timeoutSeconds);
+            if (!last.Success) return last;
+        }
+
+        return last;
+    }
+
+    private ScsiResult ReadAlternateRaw(long lba, int count, byte[] destination, int destinationOffset,
+                                        int timeoutSeconds)
     {
         var cdb = new byte[12];
         cdb[0] = 0xBE;
@@ -516,6 +673,16 @@ public sealed class OpticalDrive : IDisposable
         cdb[4] = 0x02; // LoEj = 1, Start = 0
         return Execute(cdb, null, 0, true, 20).Success;
     }
+
+    // ---------------------------------------------------------- ISectorReader
+
+    string ISectorReader.Description => $"Unità {DriveLetter}:";
+
+    bool ISectorReader.Read(long lba, int count, byte[] destination, int destinationOffset, int timeoutSeconds)
+        => ReadSectors(lba, count, destination, destinationOffset, timeoutSeconds).Success;
+
+    bool ISectorReader.ReadAlternate(long lba, int count, byte[] destination, int destinationOffset, int timeoutSeconds)
+        => ReadSectorsAlternate(lba, count, destination, destinationOffset, timeoutSeconds).Success;
 
     public static long ReadBe32(byte[] b, int offset) =>
         ((long)b[offset] << 24) | ((long)b[offset + 1] << 16) | ((long)b[offset + 2] << 8) | b[offset + 3];

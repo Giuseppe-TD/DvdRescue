@@ -63,10 +63,27 @@ DVDRescue evita entrambe le cose:
   dopo averne letto abbastanza da sapere che vuoto è. Il salto non supera mai i 4 MB, quindi non
   può scavalcare una registrazione di più di quattro o cinque secondi; con la spunta *scansione
   approfondita* i salti si disattivano del tutto.
-- **Sugli errori si rinuncia in fretta.** Un tentativo per settore, timeout corto, e un blocco
-  illeggibile non viene suddiviso fino al singolo settore: costava più di mille comandi al lettore
-  per un megabyte di nulla. Dopo qualche migliaio di settori illeggibili di fila la scansione si
-  ferma da sola: l'area scritta è finita.
+- **Le richieste sono grandi quanto il lettore le accetta, non di più.** È il numero che decide
+  tutto ed è anche quello che si sbaglia più facilmente. Il pass-through SCSI passa per
+  l'adattatore, che ha un tetto ai byte trasferibili in un solo comando: su parecchi lettori USB
+  e ATAPI sono 64 KB. Chiedere un megabyte non dà una lettura parziale, dà un **rifiuto secco**,
+  con il disco perfettamente sano. Chi scambia quel rifiuto per un settore rovinato si mette a
+  suddividere il blocco fino al singolo settore e finisce per leggere tutto il DVD 2 KB alla
+  volta: funziona, e ci mette un'ora. All'apertura del lettore DVDRescue chiede il tetto al
+  driver e poi lo **verifica leggendo davvero**, perché i due valori non sempre coincidono.
+- **Sugli errori si rinuncia in fretta, e nel vuoto si rinuncia subito.** Suddividere un blocco
+  serve a salvare i settori buoni attorno a un graffio; oltre i 128 KB di errori consecutivi non
+  c'è nessun graffio, c'è area non scritta, e da lì in poi ogni suddivisione produce solo comandi
+  destinati a fallire — un migliaio per megabyte, che sul lettore vero sono minuti di attesa per
+  non recuperare niente. Dopo qualche migliaio di settori illeggibili di fila la scansione si
+  ferma da sola: l'area scritta è finita (a meno che il limite non sia già noto, e allora quella
+  scorciatoia si disattiva, così una zona non scritta in mezzo al disco non fa perdere il video
+  che viene dopo).
+- **Mentre si cerca non si insiste mai.** Capire *dove* stanno i dati e recuperarli sono due
+  mestieri diversi. Durante il riconoscimento e i sondaggi l'impegno scende al minimo qualunque
+  cosa sia stata scelta, e prima di ogni lettura grande si prova un settore solo: se quello non
+  risponde si tira dritto. Senza questa distinzione un semplice sondaggio su un disco messo male
+  costava tre minuti e mezzo.
 
 Misurato sul materiale di prova, contando le richieste al supporto (che è ciò che costa tempo su
 un lettore ottico, non i byte):
@@ -80,9 +97,9 @@ un lettore ottico, non i byte):
 Il registro riporta i tempi di ogni fase e il numero di letture, così se qualcosa rallenta si vede
 subito dove.
 
-Per i dischi messi male c'è la spunta **Recupero insistente**: rimette i tentativi ripetuti e la
-suddivisione fino al singolo settore. Recupera di più, ma è molto più lento — va usata quando
-serve davvero, non per abitudine.
+Sui dischi messi male l'impegno cresce da solo, in tre gradini (vedi più avanti). La spunta
+**Parti subito col recupero insistente** salta direttamente all'ultimo: serve solo se si sa già
+com'è messo il disco, altrimenti conviene lasciar fare al programma.
 
 ### Lettura al volo
 
@@ -187,6 +204,41 @@ quando non è raggiungibile: il programma prova `Y:\riprese`, poi `\\server\cond
 e solo se fallisce anche quello chiede le credenziali. La casella si aggiorna con il percorso che
 ha funzionato, così la volta dopo parte già giusta.
 
+## La durata che vedi nell'elenco
+
+È il numero che si guarda per capire se il recupero ha funzionato, quindi vale la pena spiegare
+come viene fuori — ci sono tre trappole e ci sono cascato in tutte e tre.
+
+**Sottrarre il primo orologio dall'ultimo non funziona.** L'orologio dello stream MPEG riparte da
+capo a ogni registrazione: su un DVD di famiglia con venti riprese quella differenza misura solo
+l'ultima, e mezz'ora di video diventa cinque secondi.
+
+**Un ritmo unico applicato a tutto nemmeno.** I byte al secondo cambiano parecchio: una ripresa
+ferma su un muro occupa pochissimo, una piena di movimento molto di più. Il ritmo va misurato
+pezzo per pezzo.
+
+**Un tratto non è tutto video.** In modalità file unico si prende l'intera area fra il primo e
+l'ultimo settore video: se in mezzo ci sono megabyte vuoti — un DVD-RW con registrazioni
+cancellate — contarli al ritmo del video gonfiava la durata di nove volte.
+
+Come funziona adesso: sedici assaggi da un megabyte sparsi sul tratto; di ognuno si conta
+*quanti* settori sono video e si misura il ritmo dal primo all'ultimo pack dentro quella stessa
+lettura. Un assaggio da un megabyte letto di seguito costa meno di otto letture sparse, e in
+cambio dà sia il ritmo sia la densità, contati esattamente. I tratti sotto gli 8 MB si leggono
+tutti: è esatto e costa niente. E se la densità complessiva scende sotto la metà, la lettura
+rapida si tira indietro da sola e passa alla ricerca vera, perché su un disco pieno di buchi la
+sua assunzione non regge.
+
+Misurato sul materiale di prova, contro la verità nota:
+
+| Caso | Durata reale | File unico | File separati |
+|---|---|---|---|
+| 10 riprese da 20 s in fila (orologio che riparte 9 volte) | 03:20 | **03:23** | 03:24 |
+| 2 riprese da 20 s in 300 MB quasi vuoti | 40 s | **40,9 s** (scorciatoia rifiutata) | 40,9 s |
+| 2 registrazioni attaccate, 20 s + 7 s | 28 s | **24,8 s** | 28,6 s |
+
+Sul caso che conta — riprese continue, il DVD di videocamera — l'errore è sotto il 2%.
+
 ## Lettura rapida quando serve un file unico
 
 Su un disco senza filesystem — il caso dei miniDVD non finalizzati — trovare i confini fra una
@@ -218,18 +270,29 @@ Il metodo veloce va bene sulla maggior parte dei dischi, ma su un supporto vecch
 può non bastare: i settori che al primo colpo non rispondono vengono lasciati perdere, e se
 capitano proprio dove sta il video il risultato è "nessun video individuato".
 
-Quando succede il programma **non si ferma lì e non chiede niente**: rifà l'analisi da solo con
-la scansione approfondita e il recupero insistente, e lo scrive nel registro. Su un DVD-RW del
-2006 questa è la differenza fra un disco apparentemente vuoto e quaranta minuti di riprese.
+Quando succede il programma **non si ferma lì e non chiede niente**: riprova da solo, e lo
+scrive nel registro. Ma riprova *per gradi*, che è la parte che conta — saltare dritti al metodo
+ostinato su un disco grande vuol dire mezz'ora di attesa per scoprire che non c'era niente.
 
-Le due caselle restano a disposizione per partire subito in modalità ostinata quando si sa già
-che il disco è messo male, ma non c'è bisogno di ricordarsene: servono a risparmiare il primo
-tentativo, non a far funzionare il programma.
+| Gradino | Cosa fa | Quanto costa |
+|---|---|---|
+| **1. veloce** | un tentativo per settore, salta le zone vuote, sondaggio rapido dell'area video | secondi |
+| **2. via di mezzo** | legge tutto di seguito senza saltare, e sui settori che non rispondono prova il comando alternativo (READ CD) — quello che certi lettori accettano dove il primo fallisce | qualche minuto su un disco intero |
+| **3. insistente** | tre tentativi per settore e suddivisione fino al singolo settore | lento, e lo dice: si ferma con **Interrompi** |
 
-Un'altra cosa che il metodo veloce ora gestisce: il video non sempre comincia all'inizio del
-disco. Su un DVD-RW formattato in modalità VR la testa è occupata da strutture e riserve, e la
-prima ripresa parte anche decine di megabyte più avanti — la ricerca rapida arriva fino a 256 MB
-prima di rinunciare.
+Il secondo gradino è quello nuovo, ed è quello che risolve quasi tutti i casi reali: su un DVD-RW
+del 2006 è la differenza fra un disco apparentemente vuoto e quaranta minuti di riprese, senza
+pagare il prezzo del terzo. L'estrazione poi usa lo stesso impegno che ha permesso di trovare il
+video, altrimenti i settori strappati a fatica tornerebbero vuoti nel file.
+
+Il sondaggio rapido non viene rifatto ai tentativi successivi al primo: è già stato fatto e non
+ha trovato niente, ripeterlo è solo tempo.
+
+Un'altra cosa che il metodo veloce gestisce: il video non sempre comincia all'inizio del disco.
+Su un DVD-RW formattato in modalità VR la testa è occupata da strutture e riserve, e la prima
+ripresa parte anche decine di megabyte più avanti. I primi 16 MB si leggono di seguito, così una
+ripresa breve in testa non sfugge, poi si assaggia ogni 8 MB **fino in fondo all'area scritta**
+invece di arrendersi a metà disco.
 
 ## Se non trova niente
 
@@ -239,6 +302,9 @@ prima di rinunciare.
   piena velocità saltano.
 - **Spunta la scansione approfondita**: ignora le strutture e passa in rassegna tutti i settori.
   Più lenta, ma è l'ultima spiaggia quando le IFO sono distrutte.
+- **Guarda il registro alla riga "Trasferimento massimo"**: dice quanti settori per volta accetta
+  il lettore. Se è sceso a 1 o 2 settori il lettore sta rifiutando quasi tutto e conviene
+  provarne un altro, prima ancora di insistere col recupero.
 - **Pulisci il disco** dal centro verso il bordo, in linea retta.
 
 ---
@@ -278,6 +344,14 @@ cd tests/TestHarness && dotnet run -c Release
 Il controllo che conta è il confronto fra i due criteri: sullo stesso disco le strutture danno
 **1 titolo** dove il vecchio taglio a ogni salto d'orologio ne produceva **4**. Su un disco vero
 con molti capitoli la differenza è fra un file e più di cento.
+
+C'è poi una sezione che collauda la parte più difficile da provare senza un DVD rovinato in mano:
+il comportamento sul lettore. Un finto lettore riproduce il tetto ai settori per comando e i
+settori che non rispondono, e il banco verifica che un megabyte venga letto per intero in 16
+comandi anche con il tetto a 64 KB, che la via di mezzo recuperi un graffio col comando
+alternativo in una trentina di comandi, e che sei megabyte di vuoto non ne costino mai più di
+qualche centinaio. È il collaudo che avrebbe preso al volo il difetto che faceva leggere i dischi
+grandi 2 KB alla volta.
 
 ---
 

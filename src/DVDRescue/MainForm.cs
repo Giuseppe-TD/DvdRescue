@@ -546,13 +546,31 @@ public partial class MainForm : Form
                 statusText = opened.DiscStatusText;
                 foreach (var note in opened.Notes) Log("Nota: " + note);
 
-                // la ricerca del limite dell'area scritta viene fatta solo se serve la scansione
+                // La ricerca del limite dell'area scritta viene fatta solo se serve la scansione,
+                // e una volta sola: sui dischi messi male costa una quindicina di sondaggi, e
+                // rifarla a ogni tentativo vorrebbe dire pagarla tre volte per lo stesso numero.
+                long cachedLimit = long.MinValue;
+
                 verifyLimit = () =>
                 {
-                    long verified = DriveAccess.VerifyWrittenLimit(opened.Source, opened.EstimatedLastSector, Log, ct);
-                    if (verified > 0) opened.Source.SetTotalBlocks(verified + 1);
+                    if (cachedLimit == long.MinValue)
+                    {
+                        cachedLimit = DriveAccess.VerifyWrittenLimit(opened.Source, opened.EstimatedLastSector, Log, ct);
+
+                        if (cachedLimit > 0)
+                        {
+                            opened.Source.SetTotalBlocks(cachedLimit + 1);
+
+                            // Adesso il limite è noto. Continuare a indovinarlo dai settori
+                            // illeggibili non serve più e fa danno: se in mezzo al disco c'è
+                            // una zona non scritta, la ricerca si fermerebbe lì invece di
+                            // arrivare al video che sta dopo.
+                            opened.Source.ConsecutiveFailuresLimit = long.MaxValue;
+                        }
+                    }
+
                     opened.Source.ResetEndOfData();
-                    return verified;
+                    return cachedLimit;
                 };
 
                 if (chkSaveImage.Checked)
@@ -568,46 +586,76 @@ public partial class MainForm : Form
             bool preciseSplit = cmbSplit.SelectedIndex != 0;   // serve solo se i file vanno separati
             var textProgress = CreateTextProgress();
 
-            var result = await Task.Run(() =>
-            {
-                var r = RecoveryEngine.Analyze(source, deep, verifyLimit, textProgress, Log, ct, preciseSplit);
-                r.MediaText = mediaText;
-                r.DiscStatusText = statusText;
-                return r;
-            }, ct);
+            var optical = _source as OpticalBlockSource;
 
-            // Se il primo giro non trova niente si riprova da soli col metodo più ostinato,
-            // invece di rimandare la palla all'utente: su un disco messo male la differenza
-            // fra "nessun video" e quaranta minuti di riprese è tutta lì.
-            if (result.Titles.Count == 0 && !(deep && thorough))
+            async Task<RecoveryResult> AttemptAsync(ReadEffort effort, bool deepScan, bool quickScan)
             {
-                Log("Nessun video col metodo veloce: riprovo con scansione approfondita e recupero insistente.");
-
-                if (_source is OpticalBlockSource optical)
+                if (optical != null)
                 {
-                    optical.ThoroughMode = true;
+                    optical.Effort = effort;
                     optical.ResetEndOfData();
                 }
 
-                var second = await Task.Run(() =>
+                return await Task.Run(() =>
                 {
-                    var r = RecoveryEngine.Analyze(source, true, verifyLimit, textProgress, Log, ct, preciseSplit);
+                    var r = RecoveryEngine.Analyze(source, deepScan, verifyLimit, textProgress, Log, ct,
+                                                   preciseSplit, quickScan);
                     r.MediaText = mediaText;
                     r.DiscStatusText = statusText;
                     return r;
                 }, ct);
+            }
+
+            var baseEffort = thorough ? ReadEffort.Thorough : ReadEffort.Fast;
+            var workingEffort = baseEffort;
+
+            var result = await AttemptAsync(baseEffort, deep, quickScan: true);
+
+            // Se il primo giro non trova niente non si rimanda la palla all'utente: si riprova
+            // da soli. Ma per gradi, perché saltare subito al metodo insistente su un disco
+            // grande vuol dire mezz'ora di attesa. Il gradino intermedio legge tutto di seguito
+            // senza saltare le zone vuote e usa il comando alternativo sui settori che non
+            // rispondono: costa poco e basta quasi sempre.
+            if (result.Titles.Count == 0 && optical != null && !thorough)
+            {
+                Log("Il metodo veloce non ha trovato video: riprovo con una lettura più attenta.");
+                var second = await AttemptAsync(ReadEffort.Balanced, deepScan: true, quickScan: false);
 
                 if (second.Titles.Count > 0)
                 {
-                    Log($"Il secondo tentativo ha trovato {second.Titles.Count} video: " +
-                        "su questo disco servono le letture insistenti.");
+                    Log($"La lettura più attenta ha trovato {second.Titles.Count} video.");
                     result = second;
+                    workingEffort = ReadEffort.Balanced;
+                }
+            }
+
+            // Ultimo gradino: qui si insiste sul serio, tre tentativi per settore. È il più lento
+            // e su un disco grande può durare parecchio, quindi lo si dice chiaramente — il
+            // pulsante Interrompi resta attivo.
+            if (result.Titles.Count == 0 && !(deep && thorough))
+            {
+                Log(optical != null
+                    ? "Ancora niente: provo il recupero insistente. È il metodo più lento, si può fermare con Interrompi."
+                    : "Riprovo ignorando le strutture e scandendo tutti i settori.");
+
+                var third = await AttemptAsync(ReadEffort.Thorough, deepScan: true, quickScan: false);
+
+                if (third.Titles.Count > 0)
+                {
+                    Log($"Il recupero insistente ha trovato {third.Titles.Count} video: " +
+                        "su questo disco servono le letture ostinate.");
+                    result = third;
+                    workingEffort = ReadEffort.Thorough;
                 }
                 else
                 {
-                    Log("Niente nemmeno col secondo tentativo.");
+                    Log("Niente da fare: nessun video leggibile su questo disco.");
                 }
             }
+
+            // L'estrazione deve leggere il disco con lo stesso impegno che ha permesso di
+            // trovarlo, altrimenti i settori recuperati a fatica tornerebbero vuoti nel file.
+            if (optical != null) optical.Effort = workingEffort;
 
             _result = result;
             foreach (var note in result.Notes) Log("· " + note);

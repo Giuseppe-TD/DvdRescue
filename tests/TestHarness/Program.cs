@@ -42,6 +42,8 @@ internal static class Program
         TestQuickScan();
         await TestFileNames();
         TestSettings();
+        TestDurationAccuracy();
+        TestDriveReadPolicy();
         TestBadInput();
 
         Console.WriteLine($"\n=== {(_failures == 0 ? "TUTTI I CONTROLLI SUPERATI" : _failures + " CONTROLLI FALLITI")} ===");
@@ -308,8 +310,9 @@ internal static class Program
     {
         Section("Lettura rapida quando serve un file unico");
 
-        string path = Path.Combine(_media, "raw_grande.bin");
-        if (!File.Exists(path)) { Console.WriteLine("  (raw_grande.bin assente, salto)"); return; }
+        // Un disco pieno di riprese una dietro l'altra: il caso in cui la scorciatoia vale.
+        string path = Path.Combine(_media, "lungo.bin");
+        if (!File.Exists(path)) { Console.WriteLine("  (lungo.bin assente, salto)"); return; }
 
         using var innerFast = new FileBlockSource(path);
         using var fast = new CountingSource(innerFast);
@@ -333,8 +336,22 @@ internal static class Program
         Check("la durata è comunque plausibile", quick.Titles.Count > 0 && quick.Titles[0].Seconds > 1,
               quick.Titles.Count > 0 ? $"{quick.Titles[0].Seconds:F1} s" : "");
         Check("il titolo copre tutta l'area video",
-              quick.Titles.Count > 0 && quick.Titles[0].Bytes > 250L * 1024 * 1024,
+              quick.Titles.Count > 0 && quick.Titles[0].Bytes > 150L * 1024 * 1024,
               quick.Titles.Count > 0 ? quick.Titles[0].SizeText : "");
+
+        // E il caso opposto: un disco con dei buchi in mezzo. Qui la scorciatoia NON deve
+        // scattare, perché prendere tutto il tratto come un blocco unico darebbe una durata
+        // sbagliata di parecchie volte. Meglio pagare la ricerca vera.
+        string sparse = Path.Combine(_media, "raw_grande.bin");
+        if (!File.Exists(sparse)) return;
+
+        using var innerSparse = new FileBlockSource(sparse);
+        var onSparse = RecoveryEngine.Analyze(innerSparse, false, null, null, _ => { },
+                                              CancellationToken.None, preciseSplit: false);
+
+        Console.WriteLine($"  disco con buchi:   {onSparse.Titles.Count} titolo/i, " +
+                          $"rapida = {onSparse.QuickScan}");
+        Check("su un disco pieno di buchi la scorciatoia si tira indietro", !onSparse.QuickScan);
     }
 
     private static void TestDurationWithClockResets()
@@ -635,6 +652,261 @@ internal static class Program
         catch (Exception ex)
         {
             Check("nessuna eccezione su un file troncato", false, ex.Message);
+        }
+    }
+
+    // ------------------------------------------------------------ durata dichiarata
+
+    /// <summary>
+    /// La durata mostrata nell'elenco è la cosa che l'utente guarda per capire se il recupero
+    /// ha funzionato: se dice cinque secondi su mezz'ora di riprese, il programma sembra rotto
+    /// anche quando i dati ci sono tutti. Qui si confronta con la verità nota.
+    /// </summary>
+    private static void TestDurationAccuracy()
+    {
+        Section("Durata dichiarata: confronto con la verità");
+
+        void Case(string file, double realSeconds, string description)
+        {
+            string path = Path.Combine(_media, file);
+            if (!File.Exists(path)) { Console.WriteLine($"  ({file} assente, salto)"); return; }
+
+            using var inner = new FileBlockSource(path);
+            using var counter = new CountingSource(inner);
+
+            // modalità "file unico": è quella predefinita, quindi è quella che conta
+            var quick = RecoveryEngine.Analyze(counter, false, null, null, _ => { }, CancellationToken.None,
+                                               preciseSplit: false);
+
+            using var innerFull = new FileBlockSource(path);
+            var precise = RecoveryEngine.Analyze(innerFull, false, null, null, _ => { }, CancellationToken.None,
+                                                 preciseSplit: true);
+
+            double quickSeconds = quick.Titles.Sum(t => t.Seconds);
+            double preciseSeconds = precise.Titles.Sum(t => t.Seconds);
+
+            Console.WriteLine($"  {description}");
+            Console.WriteLine($"    durata reale:              {Fmt(realSeconds)}");
+            Console.WriteLine($"    file unico (predefinito):  {Fmt(quickSeconds)}  " +
+                              $"({counter.BytesRead / 1048576.0:F0} MB letti)");
+            Console.WriteLine($"    file separati:             {Fmt(preciseSeconds)}");
+
+            Check($"{file}: la durata in modalità file unico è credibile",
+                  Math.Abs(quickSeconds - realSeconds) < realSeconds * 0.20,
+                  $"{Fmt(quickSeconds)} contro {Fmt(realSeconds)}");
+
+            Check($"{file}: la durata coi file separati è credibile",
+                  Math.Abs(preciseSeconds - realSeconds) < realSeconds * 0.20,
+                  $"{Fmt(preciseSeconds)} contro {Fmt(realSeconds)}");
+        }
+
+        // Il caso di Giuseppe: una cassetta di famiglia, riprese una dietro l'altra.
+        // L'orologio MPEG riparte a ogni ripresa: sottrarre primo e ultimo darebbe 20 s su 200.
+        Case("lungo.bin", 200.0, "riprese continue: 10 da 20 s, orologio che riparte 9 volte");
+
+        // Il caso opposto: poco video sparso in un disco quasi vuoto. Qui l'errore facile è
+        // contare come video anche i megabyte vuoti in mezzo.
+        Case("raw_grande.bin", 40.0, "due riprese da 20 s in 300 MB di disco quasi vuoto");
+
+        // Tratto unico con dentro tre registrazioni diverse
+        Case("raw.bin", 28.0, "due registrazioni attaccate, 20 s + 7 s");
+    }
+
+    private static string Fmt(double seconds) =>
+        seconds >= 60 ? $"{TimeSpan.FromSeconds(seconds):mm\\:ss} ({seconds:F0} s)" : $"{seconds:F1} s";
+
+    // ------------------------------------------------- comportamento sul lettore
+
+    /// <summary>
+    /// Finto lettore ottico. Riproduce le due cose che sul lettore vero decidono tutto:
+    /// il tetto ai settori per comando imposto dall'adattatore, e i settori che non rispondono.
+    /// </summary>
+    private sealed class FakeDrive : ISectorReader
+    {
+        private readonly byte[] _disc;
+        private readonly Func<long, SectorState> _state;
+
+        public enum SectorState { Good, OnlyAlternate, Dead }
+
+        public long Commands;
+        public long AlternateCommands;
+
+        public FakeDrive(byte[] disc, int maxSectorsPerRead, Func<long, SectorState> state)
+        {
+            _disc = disc;
+            MaxSectorsPerRead = maxSectorsPerRead;
+            _state = state;
+        }
+
+        public string Description => "finto lettore";
+        public int MaxSectorsPerRead { get; }
+
+        public bool Read(long lba, int count, byte[] destination, int destinationOffset, int timeoutSeconds)
+        {
+            Commands++;
+
+            // è questo il punto: oltre il tetto l'adattatore rifiuta, disco sano o no
+            if (count > MaxSectorsPerRead) return false;
+
+            for (long s = lba; s < lba + count; s++)
+                if (s >= _disc.Length / 2048 || _state(s) != SectorState.Good) return false;
+
+            Array.Copy(_disc, lba * 2048, destination, destinationOffset, count * 2048);
+            return true;
+        }
+
+        public bool ReadAlternate(long lba, int count, byte[] destination, int destinationOffset, int timeoutSeconds)
+        {
+            AlternateCommands++;
+            Commands++;
+
+            if (count > MaxSectorsPerRead) return false;
+
+            for (long s = lba; s < lba + count; s++)
+                if (s >= _disc.Length / 2048 || _state(s) == SectorState.Dead) return false;
+
+            Array.Copy(_disc, lba * 2048, destination, destinationOffset, count * 2048);
+            return true;
+        }
+    }
+
+    private static byte[] MakeFakeDisc(int sectors)
+    {
+        var disc = new byte[sectors * 2048];
+
+        for (int s = 0; s < sectors; s++)
+        {
+            int o = s * 2048;
+            disc[o] = 0x00; disc[o + 1] = 0x00; disc[o + 2] = 0x01; disc[o + 3] = 0xBA;
+            disc[o + 4] = 0x44; disc[o + 6] = 0x04; disc[o + 8] = 0x04;
+            disc[o + 9] = 0x01; disc[o + 12] = 0x03;
+        }
+
+        return disc;
+    }
+
+    private static void TestDriveReadPolicy()
+    {
+        Section("Come si legge un lettore che rifiuta le richieste grandi");
+
+        var disc = MakeFakeDisc(4096);                       // 8 MB
+        var buffer = new byte[512 * 2048];
+
+        // --- disco sano, lettore con il tetto tipico di 64 KB ---------------------
+        // È il caso che rompeva tutto: il programma chiedeva un megabyte alla volta, il driver
+        // rifiutava, e quel rifiuto veniva scambiato per un disco rovinato.
+        var healthy = new FakeDrive(disc, 32, _ => FakeDrive.SectorState.Good);
+        using (var source = new OpticalBlockSource(healthy, 4096))
+        {
+            int got = source.ReadBlocks(0, 512, buffer, 0);
+
+            Check("un megabyte viene letto tutto anche se il lettore accetta 64 KB",
+                  got == 512, $"{got} settori su 512");
+            Check("e costa esattamente una richiesta per pezzo, non centinaia",
+                  healthy.Commands == 16, $"{healthy.Commands} comandi");
+            Check("nessun settore marcato come rovinato", source.BadBlockCount == 0,
+                  $"{source.BadBlockCount}");
+        }
+
+        // --- un graffio isolato in mezzo al video ---------------------------------
+        FakeDrive.SectorState Scratch(long s) =>
+            s >= 300 && s < 302 ? FakeDrive.SectorState.OnlyAlternate : FakeDrive.SectorState.Good;
+
+        var scratchedFast = new FakeDrive(disc, 32, Scratch);
+        using (var source = new OpticalBlockSource(scratchedFast, 4096) { Effort = ReadEffort.Fast })
+        {
+            source.ReadBlocks(0, 512, buffer, 0);
+            Console.WriteLine($"  veloce:     {scratchedFast.Commands} comandi, " +
+                              $"{source.BadBlockCount} settori persi");
+            Check("la modalità veloce perde solo l'intorno del graffio",
+                  source.BadBlockCount > 0 && source.BadBlockCount <= 16, $"{source.BadBlockCount}");
+        }
+
+        var scratchedBalanced = new FakeDrive(disc, 32, Scratch);
+        using (var source = new OpticalBlockSource(scratchedBalanced, 4096) { Effort = ReadEffort.Balanced })
+        {
+            int got = source.ReadBlocks(0, 512, buffer, 0);
+            Console.WriteLine($"  via di mezzo: {scratchedBalanced.Commands} comandi " +
+                              $"({scratchedBalanced.AlternateCommands} col comando alternativo), " +
+                              $"{source.BadBlockCount} settori persi");
+
+            Check("la via di mezzo recupera il graffio col comando alternativo",
+                  got == 512 && source.BadBlockCount == 0, $"{got} settori, {source.BadBlockCount} persi");
+            Check("e lo fa senza esplodere in comandi", scratchedBalanced.Commands < 120,
+                  $"{scratchedBalanced.Commands} comandi");
+        }
+
+        // --- mezzo disco non scritto ----------------------------------------------
+        // Qui insistere non serve a niente: il costo deve restare vicino a una richiesta
+        // per pezzo, altrimenti sono i minuti di attesa che l'utente vede.
+        FakeDrive.SectorState Empty(long s) => s >= 1024 ? FakeDrive.SectorState.Dead : FakeDrive.SectorState.Good;
+
+        // Il tetto è per modalità, e conta perché sul lettore vero un comando fallito costa
+        // fra i cinquanta e i cento millisecondi: mille comandi sono un minuto e mezzo buttato.
+        foreach (var (effort, budget) in new[]
+                 {
+                     (ReadEffort.Fast, 300L),
+                     (ReadEffort.Balanced, 600L),
+                     (ReadEffort.Thorough, 2600L)
+                 })
+        {
+            var drive = new FakeDrive(disc, 32, Empty);
+            using var source = new OpticalBlockSource(drive, 4096)
+            {
+                Effort = effort,
+                ConsecutiveFailuresLimit = long.MaxValue     // niente scorciatoie: si legge tutto
+            };
+
+            for (long s = 0; s < 4096; s += 512) source.ReadBlocks(s, 512, buffer, 0);
+
+            Console.WriteLine($"  {effort,-8}: {drive.Commands} comandi su 6 MB di vuoto " +
+                              $"(circa {drive.Commands * 0.07:F0} s sul lettore vero)");
+
+            Check($"{effort}: il vuoto non fa esplodere i comandi", drive.Commands < budget,
+                  $"{drive.Commands} comandi, limite {budget}");
+        }
+
+        // --- la fase esplorativa non insiste mai -----------------------------------
+        var probing = new FakeDrive(disc, 32, Empty);
+        using (var source = new OpticalBlockSource(probing, 4096)
+               {
+                   Effort = ReadEffort.Thorough,
+                   Exploring = true,
+                   ConsecutiveFailuresLimit = long.MaxValue
+               })
+        {
+            for (long s = 1024; s < 4096; s += 512) source.ReadBlocks(s, 512, buffer, 0);
+            Console.WriteLine($"  esplorazione: {probing.Commands} comandi, " +
+                              $"{probing.AlternateCommands} alternativi");
+
+            Check("durante l'esplorazione non si usa il comando alternativo",
+                  probing.AlternateCommands == 0, $"{probing.AlternateCommands}");
+        }
+
+        // --- fine dell'area scritta ------------------------------------------------
+        var stopping = new FakeDrive(disc, 32, Empty);
+        using (var source = new OpticalBlockSource(stopping, 4096)
+               {
+                   Effort = ReadEffort.Fast,
+                   ConsecutiveFailuresLimit = 2048      // 4 MB: il finto disco ne ha 6 di vuoto
+               })
+        {
+            for (long s = 0; s < 4096; s += 512) source.ReadBlocks(s, 512, buffer, 0);
+            Check("dopo abbastanza vuoto si capisce che il disco è finito", source.ReachedEndOfData);
+        }
+
+        // ...ma solo se prima si era letto qualcosa: un disco che comincia con una zona
+        // illeggibile non deve far rinunciare prima ancora di aver visto il video
+        var deadStart = new FakeDrive(disc, 32, _ => FakeDrive.SectorState.Dead);
+        using (var source = new OpticalBlockSource(deadStart, 4096)
+               {
+                   Effort = ReadEffort.Fast,
+                   ConsecutiveFailuresLimit = 512
+               })
+        {
+            for (long s = 0; s < 4096; s += 512) source.ReadBlocks(s, 512, buffer, 0);
+            Check("un disco illeggibile fin dall'inizio non viene dato per finito",
+                  !source.ReachedEndOfData);
         }
     }
 

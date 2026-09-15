@@ -21,6 +21,17 @@ internal static class NativeMethods
     public const uint FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000;
 
     public const uint IOCTL_SCSI_PASS_THROUGH_DIRECT = 0x0004D014;
+
+    /// <summary>
+    /// IOCTL_STORAGE_QUERY_PROPERTY: con StorageAdapterProperty dice quanti byte al massimo
+    /// l'adattatore accetta in un solo comando. È il numero che decide la velocità di tutto:
+    /// una richiesta più grande viene rifiutata a prescindere da com'è messo il disco.
+    /// </summary>
+    public const uint IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400;
+
+    public const int StorageAdapterProperty = 1;
+    public const int PropertyStandardQuery = 0;
+
     public const uint IOCTL_STORAGE_CHECK_VERIFY = 0x002D4800;
     public const uint IOCTL_STORAGE_EJECT_MEDIA = 0x002D4808;
     public const uint IOCTL_STORAGE_LOAD_MEDIA = 0x002D480C;
