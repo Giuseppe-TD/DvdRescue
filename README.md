@@ -320,12 +320,28 @@ dotnet publish src/DVDRescue/DVDRescue.csproj -c Release -r win-x64 --self-conta
 
 Metti `ffmpeg.exe` in `publish/ffmpeg/` oppure lascia che l'app lo scarichi al primo utilizzo.
 
-La build automatica è in `.github/workflows/build.yml`: a ogni push esegue i test e, su un tag
-`v*`, pubblica la release con due pacchetti — uno con ffmpeg incluso e uno senza.
+La build automatica è in `.github/workflows/build.yml`: a ogni push esegue i test e costruisce
+l'eseguibile, che resta scaricabile fra gli artifact dell'esecuzione per trenta giorni.
+
+### Pubblicare una release scaricabile
+
+Due modi, entrambi producono gli stessi due pacchetti — uno con ffmpeg incluso e uno senza — e
+li allegano alla release, da cui chiunque può scaricarli senza passare da GitHub Actions.
+
+**A mano, senza toccare niente.** Scheda **Actions** → workflow **build** → **Run workflow** →
+spunta **Pubblica una release scaricabile** → **Run**. Il tag lo crea la build da sola usando la
+versione dichiarata nel `.csproj` (oggi `v1.3.1`); volendone un altro si scrive nella casella
+**tag**. Ripubblicare la stessa versione sostituisce i file della release esistente.
+
+**Col tag, come prima.** Resta valido e ha la precedenza: il numero di versione lo detta il tag.
 
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.3.1 && git push origin v1.3.1
 ```
+
+In entrambi i casi la release parte solo se i test passano: il lavoro di build dipende da quello
+di test, quindi un controllo rosso ferma la pubblicazione invece di mandare fuori un eseguibile
+che non è stato verificato.
 
 ---
 
