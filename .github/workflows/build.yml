@@ -6,7 +6,19 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ main, master ]
+
+  # Pubblicazione a mano, dalla scheda Actions di GitHub: niente tag da creare al volo
+  # e niente numero di versione da toccare. Il tag lo crea la build, se non c'è già.
   workflow_dispatch:
+    inputs:
+      pubblica:
+        description: "Pubblica una release scaricabile"
+        type: boolean
+        default: false
+      tag:
+        description: "Tag della release (vuoto = versione del progetto, es. v1.3.1)"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -58,24 +70,44 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          # Su un tag comanda il tag; altrimenti si prende quella dichiarata nel progetto,
-          # così una build da branch non si spaccia per 1.0.0 e si capisce cosa si sta usando.
-          $tag = "${{ github.ref_name }}"
+          # Tre modi di arrivare qui e tre comportamenti diversi:
+          #  - push di un tag v*      -> comanda il tag, e si pubblica
+          #  - avvio a mano, pubblica -> versione presa dal progetto, e si pubblica lo stesso
+          #  - tutto il resto         -> solo build, etichettata col numero di esecuzione
+          # così una build da branch non si spaccia per un rilascio e si capisce cosa si ha in mano.
+          $isTag   = "${{ github.ref }}".StartsWith("refs/tags/v")
+          $publish = $isTag
+          $v       = ""
+          $tagName = ""
 
-          if ($tag -match '^v(\d+\.\d+\.\d+)') {
-            $v = $Matches[1]
-            $label = $v
+          if ($isTag) {
+            $tagName = "${{ github.ref_name }}"
+            if ($tagName -match '^v(\d+\.\d+\.\d+)') { $v = $Matches[1] }
           }
-          else {
+
+          if (-not $v) {
             [xml]$proj = Get-Content "${{ env.PROJECT }}"
             $v = ($proj.Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1)
             if (-not $v) { $v = "1.0.0" }
-            $label = "$v-build.${{ github.run_number }}"
           }
 
-          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "label=$label" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if (-not $isTag -and "${{ inputs.pubblica }}" -eq "true") {
+            $publish = $true
+            $tagName = "${{ inputs.tag }}".Trim()
+            if (-not $tagName) { $tagName = "v$v" }
+          }
+
+          # Su una release il numero deve essere pulito; su una build qualsiasi serve invece
+          # sapere da quale esecuzione arriva l'exe che si ha sul disco.
+          $label = if ($publish) { $v } else { "$v-build.${{ github.run_number }}" }
+
+          "version=$v"        | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "label=$label"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tagName"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "publish=$($publish.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
           Write-Host "Versione: $v (etichetta: $label)"
+          Write-Host "Pubblicazione: $publish$(if ($publish) { " come $tagName" })"
 
       - name: Restore
         run: dotnet restore ${{ env.PROJECT }} -r win-x64
@@ -152,10 +184,12 @@ jobs:
           path: dist/*.zip
           retention-days: 30
 
-      - name: Crea la release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Pubblica la release
+        if: steps.ver.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: DVDRescue ${{ steps.ver.outputs.version }}
           files: dist/*.zip
           draft: false
           generate_release_notes: true
