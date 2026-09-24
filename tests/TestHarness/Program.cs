@@ -45,6 +45,7 @@ internal static class Program
         TestDurationAccuracy();
         TestDriveReadPolicy();
         TestMultiBorderDisc();
+        TestDamagedExtraction();
         TestBadInput();
 
         Console.WriteLine($"\n=== {(_failures == 0 ? "TUTTI I CONTROLLI SUPERATI" : _failures + " CONTROLLI FALLITI")} ===");
@@ -732,6 +733,9 @@ internal static class Program
         public long Commands;
         public long AlternateCommands;
 
+        /// <summary>Attesa su ogni comando fallito: sul lettore vero sono decimi di secondo.</summary>
+        public int MillisecondsPerFailure;
+
         public FakeDrive(byte[] disc, int maxSectorsPerRead, Func<long, SectorState> state)
         {
             _disc = disc;
@@ -747,10 +751,10 @@ internal static class Program
             Commands++;
 
             // è questo il punto: oltre il tetto l'adattatore rifiuta, disco sano o no
-            if (count > MaxSectorsPerRead) return false;
+            if (count > MaxSectorsPerRead) return Fail();
 
             for (long s = lba; s < lba + count; s++)
-                if (s >= _disc.Length / 2048 || _state(s) != SectorState.Good) return false;
+                if (s >= _disc.Length / 2048 || _state(s) != SectorState.Good) return Fail();
 
             Array.Copy(_disc, lba * 2048, destination, destinationOffset, count * 2048);
             return true;
@@ -761,13 +765,19 @@ internal static class Program
             AlternateCommands++;
             Commands++;
 
-            if (count > MaxSectorsPerRead) return false;
+            if (count > MaxSectorsPerRead) return Fail();
 
             for (long s = lba; s < lba + count; s++)
-                if (s >= _disc.Length / 2048 || _state(s) == SectorState.Dead) return false;
+                if (s >= _disc.Length / 2048 || _state(s) == SectorState.Dead) return Fail();
 
             Array.Copy(_disc, lba * 2048, destination, destinationOffset, count * 2048);
             return true;
+        }
+
+        private bool Fail()
+        {
+            if (MillisecondsPerFailure > 0) Thread.Sleep(MillisecondsPerFailure);
+            return false;
         }
     }
 
@@ -988,6 +998,101 @@ internal static class Program
             Check($"{label}: non macina le zone mai scritte",
                   drive.Commands < budget, $"{drive.Commands} comandi, limite {budget}");
         }
+    }
+
+    // ------------------------------------------------- estrazione da disco rovinato
+
+    /// <summary>
+    /// L'estrazione da un disco molto rovinato deve finire, e deve dire dove sta arrivata.
+    ///
+    /// Erano due difetti insieme. L'avanzamento contava i byte consegnati a ffmpeg, non la
+    /// posizione sul disco: coi settori rovinati scartati e ffmpeg che tira i byte quando gli
+    /// servono, restava a zero per minuti proprio mentre il lettore lavorava di più. E l'impegno
+    /// massimo non aveva un tetto, quindi su una zona distrutta non finiva mai.
+    /// </summary>
+    private static void TestDamagedExtraction()
+    {
+        Section("Estrazione da un disco molto rovinato");
+
+        const int total = 8192;                 // 16 MB
+        var disc = MakeFakeDisc(total);
+
+        // un quarto del disco non risponde più, in una fascia continua
+        FakeDrive.SectorState Damaged(long s) =>
+            s >= 2048 && s < 4096 ? FakeDrive.SectorState.Dead : FakeDrive.SectorState.Good;
+
+        var title = new RecoveryTitle
+        {
+            Name = "prova",
+            Ranges = { new RecoveryRange(0, (long)total * 2048) }
+        };
+
+        // Il finto lettore fa aspettare su ogni comando fallito, come quello vero: è lì che se
+        // ne va il tempo, non nei byte.
+        var drive = new FakeDrive(disc, 32, Damaged) { MillisecondsPerFailure = 2 };
+        using var source = new OpticalBlockSource(drive, total)
+        {
+            Effort = ReadEffort.Thorough,
+            RetryBudget = TimeSpan.FromSeconds(2)
+        };
+
+        using var stream = new RangeStream(source, title.Ranges, true, CancellationToken.None);
+        var buffer = new byte[1 << 20];
+        var watch = Stopwatch.StartNew();
+        long good = 0;
+        int read;
+
+        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0) good += read;
+        watch.Stop();
+
+        Console.WriteLine($"  {watch.Elapsed.TotalSeconds:F1} s, {drive.Commands} comandi, " +
+                          $"{good / 1048576.0:F1} MB buoni su 16, {stream.SkippedSectors} settori persi, " +
+                          $"tetto {(source.RetryBudgetSpent ? "esaurito" : "non raggiunto")}");
+
+        Check("l'estrazione finisce invece di macinare all'infinito",
+              watch.Elapsed < TimeSpan.FromSeconds(20), $"{watch.Elapsed.TotalSeconds:F1} s");
+
+        Check("il tetto ai ritentativi è scattato", source.RetryBudgetSpent);
+
+        Check("tutti i settori buoni sono stati recuperati",
+              good == 6144L * 2048, $"{good} byte su {6144L * 2048}");
+
+        Check("i settori rovinati sono stati scartati, non consegnati come spazzatura",
+              stream.SkippedSectors == 2048, $"{stream.SkippedSectors}");
+
+        // il numero che l'utente guarda: deve arrivare in fondo al disco, non fermarsi ai buoni
+        Check("l'avanzamento segue la testina e arriva in fondo",
+              stream.PositionOnDisc == stream.TotalLength,
+              $"{stream.PositionOnDisc} su {stream.TotalLength}");
+
+        // e senza tetto? il confronto è il motivo per cui il tetto esiste
+        var slowDrive = new FakeDrive(disc, 32, Damaged) { MillisecondsPerFailure = 2 };
+        using var noBudget = new OpticalBlockSource(slowDrive, total)
+        {
+            Effort = ReadEffort.Thorough,
+            RetryBudget = TimeSpan.Zero        // nessun tetto
+        };
+
+        using var slowStream = new RangeStream(noBudget, title.Ranges, true, CancellationToken.None);
+        var slowWatch = Stopwatch.StartNew();
+        while (slowStream.Read(buffer, 0, buffer.Length) > 0) { }
+        slowWatch.Stop();
+
+        Console.WriteLine($"  senza tetto: {slowWatch.Elapsed.TotalSeconds:F1} s, {slowDrive.Commands} comandi " +
+                          $"(su un lettore vero, dove un comando fallito costa 100 ms invece di 2, " +
+                          $"sarebbero {slowDrive.Commands * 0.1 / 60:F0} minuti)");
+
+        // Il tetto non azzera i ritentativi, li interrompe quando hanno già avuto la loro
+        // occasione: qui il bilancio (2 s) copre buona parte della fascia rovinata, quindi il
+        // risparmio è circa la metà. Su un disco vero, dove la fascia rovinata è di centinaia di
+        // megabyte e non di quattro, il bilancio si esaurisce all'inizio e il risparmio è enorme.
+        Check("il tetto taglia i comandi sprecati",
+              drive.Commands < slowDrive.Commands * 0.75,
+              $"{drive.Commands} contro {slowDrive.Commands}");
+
+        Check("e taglia il tempo di attesa",
+              watch.Elapsed < slowWatch.Elapsed * 0.75,
+              $"{watch.Elapsed.TotalSeconds:F1} s contro {slowWatch.Elapsed.TotalSeconds:F1} s");
     }
 
     // ------------------------------------------------------------- supporto

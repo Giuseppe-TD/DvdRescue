@@ -289,6 +289,28 @@ collaudo con un disco finto fatto così — due riprese separate da 37 MB mai sc
 morto — il vuoto costa **zero comandi in più**, e le spunte "scansione approfondita" e "recupero
 insistente" non cambiano il tempo: 658 comandi contro 660.
 
+## Quando il disco è davvero rovinato
+
+Prima o poi capita il disco che non si legge e basta. Lì contano due cose, e nessuna delle due
+è recuperare l'ultimo byte.
+
+**Sapere che sta lavorando.** L'avanzamento dell'estrazione segue la testina, non il convertitore:
+mostra dove sta sul disco, quanto ne è uscito di buono, quanti settori si sono persi e a che
+velocità sta andando. Se il lettore è in difficoltà lo dice invece di mostrare `0 MB` fermo —
+prima contava i byte consegnati a ffmpeg, che su un disco messo male restano a zero per minuti
+proprio mentre il lettore lavora di più.
+
+**Che finisca.** Il recupero insistente spende sei comandi per ogni settore che non risponde, e
+il lettore ci mette decimi di secondo a rifiutarne ognuno: un solo megabyte distrutto sono sette
+minuti, mezzo gigabyte sono ore. C'è quindi un tetto al tempo complessivo speso a ritentare —
+tre minuti — dopo il quale si prosegue in lettura veloce e lo si scrive nel registro. Ai dischi
+solo graffiati non toglie niente, perché lì i settori muti sono pochi e sparsi e il bilancio non
+si esaurisce mai; serve a non spendere ore su un disco che non ha più niente da dare.
+
+Nel collaudo, su un finto disco con un quarto della superficie morta: **6,9 s contro 14,9 s**,
+tutti i settori buoni recuperati lo stesso, quelli rotti scartati invece di finire nel file come
+spazzatura.
+
 ## Se il primo tentativo non trova niente, ci riprova da solo
 
 Il metodo veloce va bene sulla maggior parte dei dischi, ma su un supporto vecchio o rovinato

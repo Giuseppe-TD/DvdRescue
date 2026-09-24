@@ -887,6 +887,14 @@ public partial class MainForm : Form
 
                 Log($"— {title.Name} ({done} di {selected.Count}): {title.DurationText}, {title.SizeText}");
 
+                // Ogni video riparte col bilancio pieno: il tetto serve a non spendere ore su
+                // un disco morto, non a penalizzare il secondo file perché il primo era messo male.
+                if (source is OpticalBlockSource opticalSource)
+                {
+                    opticalSource.ResetRetryBudget();
+                    opticalSource.ResetEndOfData();
+                }
+
                 await TitleExtractor.ExtractAsync(source, title, options, runner, progress, Log, ct);
             }
 

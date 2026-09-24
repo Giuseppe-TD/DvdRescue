@@ -78,15 +78,31 @@ public static class TitleExtractor
         // ---------------------------------------------- conversione al volo da disco
         using var stream = new RangeStream(source, title.Ranges, filterSectors, ct);
 
+        // L'avanzamento segue la testina, non ffmpeg: vedi dove sta sul disco, quanto ne è
+        // uscito di buono e quanto se n'è perso, anche mentre è fermo su una zona rovinata.
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var optical = source as OpticalBlockSource;
+
         using var timer = new System.Threading.Timer(_ =>
         {
-            double mb = stream.BytesRead / 1048576.0;
+            double done = stream.PositionOnDisc / 1048576.0;
             double totalMb = stream.TotalLength / 1048576.0;
+            double speed = clock.Elapsed.TotalSeconds > 1 ? done / clock.Elapsed.TotalSeconds : 0;
+
+            string detail = $"{done:F0} MB di {totalMb:F0} MB";
+            if (speed > 0.05) detail += $" — {speed:F1} MB/s";
+            else if (done > 0 || clock.Elapsed.TotalSeconds > 5) detail += " — lettore in difficoltà";
+
+            long lost = stream.SkippedSectors;
+            if (lost > 0) detail += $" — {lost} settori persi";
+            if (optical is { RetryBudgetSpent: true }) detail += " — recupero ridotto";
+
             progress?.Report(new ProgressReport
             {
                 Stage = "Lettura disco",
-                Detail = $"{mb:F0} MB di {totalMb:F0} MB letti",
-                Percent = stream.TotalLength > 0 ? stream.BytesRead * 100.0 / stream.TotalLength : 0
+                Detail = detail,
+                Percent = stream.TotalLength > 0 ? stream.PositionOnDisc * 100.0 / stream.TotalLength : 0,
+                SpeedMbPerSec = speed
             });
         }, null, 1000, 1000);
 
@@ -97,7 +113,12 @@ public static class TitleExtractor
                                          progress, log, ct);
 
         if (stream.SkippedSectors > 0)
-            log($"  {stream.SkippedSectors} settori illeggibili o vuoti scartati durante la lettura.");
+            log($"  {stream.SkippedSectors} settori illeggibili o vuoti scartati durante la lettura " +
+                $"({stream.SkippedSectors * 2048.0 / 1048576.0:F0} MB persi su {stream.TotalLength / 1048576.0:F0}).");
+
+        if (optical is { RetryBudgetSpent: true })
+            log($"  Il disco è messo troppo male: dopo {optical.RetryBudget.TotalMinutes:F0} minuti passati a " +
+                "ritentare ho proseguito in lettura veloce, altrimenti non finiva più.");
 
         log(exit == 0
             ? $"  creato {Path.GetFileName(h264Path ?? remuxPath)}"

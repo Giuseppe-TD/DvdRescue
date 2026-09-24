@@ -24,8 +24,18 @@ public sealed class RangeStream : Stream
     private int _bufferLength;
     private int _bufferPosition;
 
-    /// <summary>Byte letti dal disco finora (per l'avanzamento).</summary>
+    /// <summary>Byte consegnati a chi legge, cioè quelli buoni.</summary>
     public long BytesRead => _totalRead;
+
+    /// <summary>
+    /// Byte di disco già attraversati, compresi quelli persi.
+    ///
+    /// È questo il numero da mostrare durante l'estrazione, non quello sopra. Chi legge tira i
+    /// byte quando gli servono e i settori rovinati vengono scartati, quindi su un disco messo
+    /// male i byte consegnati restano a zero per minuti mentre il lettore sta arando la superficie:
+    /// l'avanzamento sembra piantato proprio quando il programma lavora di più.
+    /// </summary>
+    public long PositionOnDisc { get; private set; }
 
     /// <summary>Settori scartati perché non contenevano dati validi.</summary>
     public long SkippedSectors { get; private set; }
@@ -37,7 +47,7 @@ public sealed class RangeStream : Stream
     /// eventuali settori illeggibili non finiscono nello stream come spazzatura.
     /// </param>
     public RangeStream(IBlockSource source, IEnumerable<RecoveryRange> ranges,
-                       bool filterInvalidSectors, CancellationToken ct, int bufferSectors = 512)
+                       bool filterInvalidSectors, CancellationToken ct, int bufferSectors = 256)
     {
         _source = source;
         _ranges = new List<RecoveryRange>(ranges);
@@ -107,6 +117,7 @@ public sealed class RangeStream : Stream
 
             _source.ReadBytes(offset, want, _buffer, 0);
             _positionInRange += want;
+            PositionOnDisc += want;
 
             if (!_filterInvalidSectors)
             {

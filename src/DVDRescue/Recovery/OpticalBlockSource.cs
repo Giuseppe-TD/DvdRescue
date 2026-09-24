@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using DVDRescue.Core;
 using DVDRescue.Native;
 
@@ -84,6 +85,31 @@ public sealed class OpticalBlockSource : BlockSourceBase
     /// </summary>
     public long StopSplittingAfterFailures { get; set; } = 64;   // 128 KB
 
+    /// <summary>
+    /// Tempo massimo da spendere complessivamente sui settori che non rispondono, dopo il quale
+    /// si continua in modalità veloce.
+    ///
+    /// Senza un tetto, l'impegno massimo su un disco molto rovinato non finisce mai: ogni settore
+    /// morto costa sei comandi, ognuno dei quali il lettore impiega decimi di secondo a rifiutare,
+    /// e un solo megabyte distrutto si porta via sette minuti. Su mezzo gigabyte sono ore, con
+    /// l'avanzamento fermo a zero — che è poi il momento in cui uno stacca il programma.
+    ///
+    /// Il tetto non toglie niente ai dischi solo graffiati: lì i settori che non rispondono sono
+    /// pochi e sparsi, il bilancio non si esaurisce mai e l'insistenza resta piena. Serve a non
+    /// spendere ore su un disco che non ha più niente da dare.
+    /// </summary>
+    public TimeSpan RetryBudget { get; set; } = TimeSpan.FromMinutes(3);
+
+    private long _retryTicks;
+
+    /// <summary>Tempo già speso sui settori che non rispondono.</summary>
+    public TimeSpan RetrySpent => TimeSpan.FromTicks(_retryTicks);
+
+    /// <summary>Vero quando il tetto è stato raggiunto: da lì in poi si legge in modalità veloce.</summary>
+    public bool RetryBudgetSpent => RetryBudget > TimeSpan.Zero && _retryTicks >= RetryBudget.Ticks;
+
+    public void ResetRetryBudget() => _retryTicks = 0;
+
     /// <summary>Settori illeggibili di fila oltre i quali si considera finita l'area scritta.</summary>
     public long ConsecutiveFailuresLimit { get; set; } = 8192;     // 16 MB
 
@@ -116,7 +142,8 @@ public sealed class OpticalBlockSource : BlockSourceBase
         ConsecutiveFailures = 0;
     }
 
-    private ReadEffort CurrentEffort => Exploring ? ReadEffort.Fast : Effort;
+    private ReadEffort CurrentEffort =>
+        Exploring || RetryBudgetSpent ? ReadEffort.Fast : Effort;
 
     private int CurrentTimeout => Exploring ? Math.Min(ReadTimeout, 5) : ReadTimeout;
 
@@ -147,12 +174,18 @@ public sealed class OpticalBlockSource : BlockSourceBase
             return done;
         }
 
+        long started = Stopwatch.GetTimestamp();
+
         if (_reader.Read(block, count, destination, destinationOffset, CurrentTimeout))
         {
             ConsecutiveFailures = 0;
             _readSomething = true;
             return count;
         }
+
+        // Da qui in poi si sta ritentando, ed è il tempo che l'utente vede passare guardando
+        // un avanzamento fermo: va contato, perché è quello che il tetto limita.
+        _retryTicks += Stopwatch.GetElapsedTime(started).Ticks;
 
         if (count == 1) return ReadSingle(block, destination, destinationOffset) ? 1 : 0;
 
@@ -200,6 +233,8 @@ public sealed class OpticalBlockSource : BlockSourceBase
 
         for (int attempt = 0; attempt < attempts; attempt++)
         {
+            long started = Stopwatch.GetTimestamp();
+
             if (_reader.Read(block, 1, destination, destinationOffset, CurrentTimeout))
             {
                 ConsecutiveFailures = 0;
@@ -214,6 +249,8 @@ public sealed class OpticalBlockSource : BlockSourceBase
                 _readSomething = true;
                 return true;
             }
+
+            _retryTicks += Stopwatch.GetElapsedTime(started).Ticks;
 
             if (attempt + 1 < attempts) Thread.Sleep(20);
         }
