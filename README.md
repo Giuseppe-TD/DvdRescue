@@ -311,6 +311,29 @@ Nel collaudo, su un finto disco con un quarto della superficie morta: **6,9 s co
 tutti i settori buoni recuperati lo stesso, quelli rotti scartati invece di finire nel file come
 spazzatura.
 
+**Aspettare il lettore.** È il difetto più subdolo di tutti, e il più facile da non vedere. Su un
+disco rovinato il lettore fa correzione d'errore per conto suo, e una lettura che *riesce* può
+metterci dieci o venti secondi. Con un'attesa massima fissa, quella lettura viene interrotta a un
+passo dal risultato, contata come errore e rifatta da capo: si paga due volte la stessa fatica per
+poi buttare via un settore che era buono. È il modo più efficace di rendere illeggibile un disco
+che si sarebbe letto.
+
+Adesso l'attesa si adatta: quando una lettura scade mentre il lettore sta ancora lavorando — o
+riesce a un soffio dal limite — l'attesa raddoppia, fino a trenta secondi, e lo si scrive nel
+registro. Nel collaudo, con un lettore che impiega una volta e mezza il tempo concesso: con
+l'attesa fissa **tutti i settori dati per persi**, con quella adattiva **tutti recuperati, e con
+meno comandi** — perché non si rifà il lavoro buttato via.
+
+**Rallentare per andare più veloce.** Suona come un controsenso ed è la cosa che funziona di più:
+a piena velocità il lettore sbaglia e ritenta da solo decine di volte prima di rispondere, a 4x
+prende il settore al primo colpo. Se dopo tre quarti di minuto la lettura è sotto 0,6 MB/s, il
+programma porta il lettore a 4x da solo e lo dice. Se la velocità l'hai scelta tu dal menu, non
+te la tocca.
+
+**Un solo giro lento.** Con *Salva anche una copia integrale del disco* si paga la lentezza una
+volta sola: l'immagine sul disco fisso si riapre poi con *Apri immagine* e ci si lavora a velocità
+piena, quante volte si vuole. La copia salta le zone mai scritte invece di aspettarle.
+
 ## Se il primo tentativo non trova niente, ci riprova da solo
 
 Il metodo veloce va bene sulla maggior parte dei dischi, ma su un supporto vecchio o rovinato

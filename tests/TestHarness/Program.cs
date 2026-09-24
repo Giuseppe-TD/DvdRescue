@@ -46,6 +46,8 @@ internal static class Program
         TestDriveReadPolicy();
         TestMultiBorderDisc();
         TestDamagedExtraction();
+        TestSlowDrive();
+        TestAutomaticSlowdown();
         TestBadInput();
 
         Console.WriteLine($"\n=== {(_failures == 0 ? "TUTTI I CONTROLLI SUPERATI" : _failures + " CONTROLLI FALLITI")} ===");
@@ -736,6 +738,19 @@ internal static class Program
         /// <summary>Attesa su ogni comando fallito: sul lettore vero sono decimi di secondo.</summary>
         public int MillisecondsPerFailure;
 
+        /// <summary>
+        /// Quanto ci mette una lettura che RIESCE. Su un disco rovinato il lettore fa correzione
+        /// d'errore per conto suo e può metterci secondi: se il programma non lo aspetta, la
+        /// interrompe e rifà tutto da capo.
+        /// </summary>
+        public int MillisecondsPerSuccess;
+
+        /// <summary>Millisecondi oltre i quali il finto lettore dichiara scaduto il tempo.</summary>
+        public int SlowSectorsFrom = int.MaxValue;
+
+        public int SpeedRequests;
+        public int SpeedKbPerSec;
+
         public FakeDrive(byte[] disc, int maxSectorsPerRead, Func<long, SectorState> state)
         {
             _disc = disc;
@@ -756,6 +771,8 @@ internal static class Program
             for (long s = lba; s < lba + count; s++)
                 if (s >= _disc.Length / 2048 || _state(s) != SectorState.Good) return Fail();
 
+            if (!Wait(lba, timeoutSeconds)) return false;
+
             Array.Copy(_disc, lba * 2048, destination, destinationOffset, count * 2048);
             return true;
         }
@@ -774,10 +791,38 @@ internal static class Program
             return true;
         }
 
+        public bool TrySetReadSpeed(int kilobytesPerSecond)
+        {
+            SpeedRequests++;
+            SpeedKbPerSec = kilobytesPerSecond;
+
+            // rallentare fa davvero effetto: il lettore smette di sbagliare
+            MillisecondsPerSuccess = 0;
+            return true;
+        }
+
         private bool Fail()
         {
             if (MillisecondsPerFailure > 0) Thread.Sleep(MillisecondsPerFailure);
             return false;
+        }
+
+        /// <summary>Attesa di una lettura riuscita; false se sfora il tempo concesso.</summary>
+        private bool Wait(long lba, int timeoutSeconds)
+        {
+            int cost = lba >= SlowSectorsFrom ? MillisecondsPerSuccess : 0;
+            if (cost <= 0) return true;
+
+            if (cost > timeoutSeconds * 1000)
+            {
+                // il comando viene interrotto: il lettore ci aveva messo la stessa fatica,
+                // ma il risultato si butta via
+                Thread.Sleep(timeoutSeconds * 1000);
+                return Fail();
+            }
+
+            Thread.Sleep(cost);
+            return true;
         }
     }
 
@@ -1093,6 +1138,157 @@ internal static class Program
         Check("e taglia il tempo di attesa",
               watch.Elapsed < slowWatch.Elapsed * 0.75,
               $"{watch.Elapsed.TotalSeconds:F1} s contro {slowWatch.Elapsed.TotalSeconds:F1} s");
+    }
+
+    // --------------------------------------------- lettore lento su disco rovinato
+
+    /// <summary>
+    /// Il difetto più subdolo: un'attesa troppo corta rende illeggibile un disco leggibile.
+    ///
+    /// Su un disco rovinato il lettore fa correzione d'errore per conto suo, e una lettura che
+    /// <i>riesce</i> può metterci dieci secondi. Con un'attesa massima di dieci secondi quella
+    /// lettura viene interrotta a un passo dal risultato, contata come errore e rifatta da capo:
+    /// si paga due volte la stessa fatica per poi buttare via un settore che era buono. Il
+    /// risultato è un disco che risulta illeggibile e un'estrazione che non finisce mai.
+    /// </summary>
+    private static void TestSlowDrive()
+    {
+        Section("Lettore che ci mette secondi anche quando la lettura riesce");
+
+        const int total = 128;                   // 256 KB: quattro comandi, il collaudo deve durare poco
+        var disc = MakeFakeDisc(total);
+        var ranges = new[] { new RecoveryRange(0, (long)total * 2048) };
+
+        // Il lettore ci mette 1,5 s per ogni lettura che RIESCE, con un'attesa massima di 1 s:
+        // è la situazione reale di un disco rovinato, in scala ridotta.
+        FakeDrive Make() => new FakeDrive(disc, 32, _ => FakeDrive.SectorState.Good)
+        {
+            MillisecondsPerSuccess = 1500,
+            SlowSectorsFrom = 0
+        };
+
+        // --- con l'attesa fissa e corta, come prima ---
+        var rigid = Make();
+        using (var source = new OpticalBlockSource(rigid, total)
+               {
+                   ReadTimeout = 1,
+                   MaxReadTimeout = 1            // nessun adattamento
+               })
+        {
+            using var stream = new RangeStream(source, ranges, true, CancellationToken.None);
+            var buffer = new byte[1 << 20];
+            long good = 0;
+            int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0) good += read;
+
+            Console.WriteLine($"  attesa fissa:    {good / 1048576.0:F1} MB su 4, " +
+                              $"{source.BadBlockCount} settori dati per persi, {rigid.Commands} comandi");
+
+            Check("con l'attesa fissa il disco risulta (a torto) rovinato",
+                  source.BadBlockCount > 0, $"{source.BadBlockCount} settori");
+        }
+
+        // --- con l'adattamento ---
+        var adaptive = Make();
+        var notices = new List<string>();
+
+        using (var source = new OpticalBlockSource(adaptive, total)
+               {
+                   ReadTimeout = 1,
+                   MaxReadTimeout = 4,
+                   Log = notices.Add
+               })
+        {
+            using var stream = new RangeStream(source, ranges, true, CancellationToken.None);
+            var buffer = new byte[1 << 20];
+            long good = 0;
+            int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0) good += read;
+
+            Console.WriteLine($"  attesa adattiva: {good / 1048576.0:F1} MB su 4, " +
+                              $"{source.BadBlockCount} settori persi, {adaptive.Commands} comandi");
+            foreach (var n in notices) Console.WriteLine($"    → {n}");
+
+            Check("aspettando il lettore il disco si legge tutto",
+                  source.BadBlockCount == 0 && good == (long)total * 2048,
+                  $"{good} byte, {source.BadBlockCount} persi");
+
+            Check("e lo scrive nel registro invece di farlo di nascosto",
+                  notices.Any(n => n.Contains("attesa massima")), string.Join(" | ", notices));
+
+            Check("costa anche meno comandi, perché non rifà il lavoro buttato",
+                  adaptive.Commands < rigid.Commands,
+                  $"{adaptive.Commands} contro {rigid.Commands}");
+        }
+    }
+
+    /// <summary>
+    /// Quando il lettore arranca, rallentarlo lo fa andare più veloce: a piena velocità sbaglia
+    /// la lettura e ritenta per conto suo, a 4x prende il settore al primo colpo.
+    /// </summary>
+    private static void TestAutomaticSlowdown()
+    {
+        Section("Rallentare il lettore quando arranca");
+
+        const int total = 4096;
+        var disc = MakeFakeDisc(total);
+        var drive = new FakeDrive(disc, 32, _ => FakeDrive.SectorState.Good)
+        {
+            MillisecondsPerSuccess = 40,
+            SlowSectorsFrom = 0
+        };
+
+        var notices = new List<string>();
+        using var source = new OpticalBlockSource(drive, total)
+        {
+            ReadTimeout = 5,
+            Log = notices.Add,
+            SlowdownAfter = TimeSpan.FromSeconds(1),     // nel programma sono 45 s
+            SlowdownBelowMbPerSec = 2.0
+        };
+
+        var buffer = new byte[128 * 2048];
+        var watch = Stopwatch.StartNew();
+
+        for (long s = 0; s < total && watch.Elapsed < TimeSpan.FromSeconds(30); s += 128)
+            source.ReadBlocks(s, 128, buffer, 0);
+
+        Console.WriteLine($"  {source.MegabytesPerSecond:F2} MB/s, " +
+                          $"{drive.SpeedRequests} richieste di rallentamento" +
+                          (drive.SpeedRequests > 0 ? $" (a {drive.SpeedKbPerSec / 1385}x)" : ""));
+        foreach (var n in notices) Console.WriteLine($"    → {n}");
+
+        Check("il lettore che arranca viene rallentato", drive.SpeedRequests == 1,
+              $"{drive.SpeedRequests} richieste");
+
+        Check("e a una velocità sensata (4x)", drive.SpeedKbPerSec == 5540,
+              $"{drive.SpeedKbPerSec} KB/s");
+
+        Check("lo si scrive nel registro invece di farlo di nascosto",
+              notices.Any(n => n.Contains("4x")), string.Join(" | ", notices));
+
+        Check("non lo rifà a ogni lettura", drive.SpeedRequests <= 1, $"{drive.SpeedRequests}");
+
+        // e se la velocità l'ha scelta l'utente, non si tocca
+        var manual = new FakeDrive(disc, 32, _ => FakeDrive.SectorState.Good)
+        {
+            MillisecondsPerSuccess = 40,
+            SlowSectorsFrom = 0
+        };
+
+        using var chosen = new OpticalBlockSource(manual, total)
+        {
+            SpeedChosenByUser = true,
+            SlowdownAfter = TimeSpan.FromSeconds(1),
+            SlowdownBelowMbPerSec = 2.0
+        };
+
+        var watch2 = Stopwatch.StartNew();
+        for (long s = 0; s < total && watch2.Elapsed < TimeSpan.FromSeconds(10); s += 128)
+            chosen.ReadBlocks(s, 128, buffer, 0);
+
+        Check("se la velocità l'ha scelta l'utente, il programma non la cambia",
+              manual.SpeedRequests == 0, $"{manual.SpeedRequests}");
     }
 
     // ------------------------------------------------------------- supporto

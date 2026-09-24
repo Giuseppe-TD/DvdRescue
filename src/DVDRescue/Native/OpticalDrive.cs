@@ -702,6 +702,8 @@ public sealed class OpticalDrive : ISectorReader, IDisposable
     bool ISectorReader.ReadAlternate(long lba, int count, byte[] destination, int destinationOffset, int timeoutSeconds)
         => ReadSectorsAlternate(lba, count, destination, destinationOffset, timeoutSeconds).Success;
 
+    bool ISectorReader.TrySetReadSpeed(int kilobytesPerSecond) => SetReadSpeed(kilobytesPerSecond);
+
     public static long ReadBe32(byte[] b, int offset) =>
         ((long)b[offset] << 24) | ((long)b[offset + 1] << 16) | ((long)b[offset + 2] << 8) | b[offset + 3];
 

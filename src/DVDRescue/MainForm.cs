@@ -612,7 +612,8 @@ public partial class MainForm : Form
                 if (chkSaveImage.Checked)
                 {
                     long limit = verifyLimit();
-                    await SaveDiscImageAsync(opened.Source, limit > 0 ? limit : opened.EstimatedLastSector, ct);
+                    await SaveDiscImageAsync(opened.Source, limit > 0 ? limit : opened.EstimatedLastSector,
+                                             opened.Written, ct);
                 }
             }
 
@@ -720,7 +721,8 @@ public partial class MainForm : Form
         }
     }
 
-    private async Task SaveDiscImageAsync(OpticalBlockSource source, long lastSector, CancellationToken ct)
+    private async Task SaveDiscImageAsync(OpticalBlockSource source, long lastSector,
+                                          List<SectorRange> writtenRanges, CancellationToken ct)
     {
         string folder = PrepareFolder(txtWorkFolder.Text);
         if (folder != txtWorkFolder.Text.Trim()) txtWorkFolder.Text = folder;
@@ -737,11 +739,19 @@ public partial class MainForm : Form
             await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 20);
             var watch = System.Diagnostics.Stopwatch.StartNew();
 
+            // Le zone mai scritte non si leggono: si scrivono come zeri e si tira dritto.
+            // Sono decine di megabyte su cui il lettore impiegherebbe minuti per dire "niente".
+            bool Scritto(long sector) =>
+                writtenRanges == null || writtenRanges.Count == 0 ||
+                writtenRanges.Any(r => sector + 255 >= r.First && sector <= r.Last);
+
             for (long sector = 0; sector < total; sector += 256)
             {
                 ct.ThrowIfCancellationRequested();
                 int count = (int)Math.Min(256, total - sector);
-                source.ReadBlocks(sector, count, buffer, 0);
+
+                if (Scritto(sector)) source.ReadBlocks(sector, count, buffer, 0);
+                else Array.Clear(buffer, 0, count * 2048);
                 await output.WriteAsync(buffer.AsMemory(0, count * 2048), ct);
 
                 if (watch.ElapsedMilliseconds > 400)

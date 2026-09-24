@@ -31,4 +31,13 @@ public interface ISectorReader
     /// fallisce, soprattutto sui dischi non finalizzati.
     /// </summary>
     bool ReadAlternate(long lba, int count, byte[] destination, int destinationOffset, int timeoutSeconds);
+
+    /// <summary>
+    /// Limita la velocità di rotazione; false se il lettore non accetta il comando.
+    ///
+    /// Sembra un controsenso ma su un disco rovinato rallentare fa andare più veloce: a piena
+    /// velocità il lettore sbaglia la lettura e la ritenta per conto suo decine di volte prima
+    /// di rispondere, mentre a 4x la prende al primo colpo.
+    /// </summary>
+    bool TrySetReadSpeed(int kilobytesPerSecond);
 }

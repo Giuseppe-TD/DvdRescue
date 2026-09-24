@@ -147,7 +147,9 @@ public static class DriveAccess
 
             var source = new OpticalBlockSource(drive, lastSector + 1, ownsDrive: false)
             {
-                Effort = thorough ? ReadEffort.Thorough : ReadEffort.Fast
+                Effort = thorough ? ReadEffort.Thorough : ReadEffort.Fast,
+                SpeedChosenByUser = readSpeedKbPerSec > 0,
+                Log = log
             };
 
             result.Source = source;

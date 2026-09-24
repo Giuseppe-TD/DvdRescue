@@ -69,8 +69,41 @@ public sealed class OpticalBlockSource : BlockSourceBase
     /// </summary>
     public bool Exploring { get; set; }
 
-    /// <summary>Timeout di una lettura normale, in secondi.</summary>
+    /// <summary>Timeout di partenza di una lettura normale, in secondi.</summary>
     public int ReadTimeout { get; set; } = 10;
+
+    /// <summary>
+    /// Tetto a cui può salire l'attesa quando il lettore è lento.
+    ///
+    /// Su un disco rovinato il lettore fa correzione d'errore per conto suo e una lettura che
+    /// <i>riesce</i> può metterci dieci o venti secondi. Con un'attesa troppo corta quella
+    /// lettura viene interrotta a un passo dal risultato, contata come errore, e rifatta da capo
+    /// — si paga due volte per poi buttare via un settore che era leggibile. È il modo più
+    /// efficace di rendere illeggibile un disco che si sarebbe letto.
+    /// </summary>
+    public int MaxReadTimeout { get; set; } = 30;
+
+    /// <summary>Dove far arrivare gli avvisi automatici (attesa alzata, velocità ridotta).</summary>
+    public Action<string> Log { get; set; }
+
+    /// <summary>Vero se la velocità l'ha già scelta l'utente: allora non si tocca.</summary>
+    public bool SpeedChosenByUser { get; set; }
+
+    /// <summary>Quanto leggere prima di giudicare se il lettore arranca.</summary>
+    public TimeSpan SlowdownAfter { get; set; } = TimeSpan.FromSeconds(45);
+
+    /// <summary>Sotto questa velocità si considera che il lettore stia arrancando, in MB/s.</summary>
+    public double SlowdownBelowMbPerSec { get; set; } = 0.6;
+
+    private int _timeout;
+    private long _bytesDelivered;
+    private readonly Stopwatch _throughput = new();
+    private bool _slowedDown;
+
+    /// <summary>Velocità media di lettura finora, in MB/s.</summary>
+    public double MegabytesPerSecond => _throughput.Elapsed.TotalSeconds > 1
+        ? _bytesDelivered / 1048576.0 / _throughput.Elapsed.TotalSeconds
+        : 0;
 
     /// <summary>Timeout dei sondaggi usati per trovare il limite dell'area scritta.</summary>
     public int ProbeTimeout { get; set; } = 4;
@@ -145,11 +178,96 @@ public sealed class OpticalBlockSource : BlockSourceBase
     private ReadEffort CurrentEffort =>
         Exploring || RetryBudgetSpent ? ReadEffort.Fast : Effort;
 
-    private int CurrentTimeout => Exploring ? Math.Min(ReadTimeout, 5) : ReadTimeout;
+    private int CurrentTimeout
+    {
+        get
+        {
+            if (_timeout < ReadTimeout) _timeout = ReadTimeout;
+
+            // Esaurito il bilancio dei ritentativi si torna all'attesa breve: a quel punto
+            // l'obiettivo è finire, non strappare altri settori.
+            if (Exploring) return Math.Min(_timeout, 5);
+            return RetryBudgetSpent ? ReadTimeout : _timeout;
+        }
+    }
+
+    /// <summary>
+    /// Una lettura riuscita che ci ha messo quasi quanto l'attesa massima è un avvertimento:
+    /// la prossima verrà interrotta per un soffio e rifatta da capo. Meglio allungare.
+    /// </summary>
+    /// <summary>
+    /// Una lettura fallita che ha consumato tutto il tempo concesso non è un settore rotto: è un
+    /// settore su cui il lettore stava ancora lavorando quando gli è stato tolto il tempo.
+    /// Allungare e riprovare una volta costa molto meno che dare per perso un settore buono.
+    ///
+    /// Si allunga solo su un errore isolato: dentro una serie di errori siamo in una zona morta,
+    /// e lì aspettare di più vuol dire solo aspettare di più.
+    /// </summary>
+    private bool TryExtendTimeout(TimeSpan took)
+    {
+        if (Exploring || RetryBudgetSpent) return false;
+        if (ConsecutiveFailures > 0) return false;
+        if (_timeout >= MaxReadTimeout) return false;
+        if (took.TotalSeconds < _timeout * 0.9) return false;      // rifiutata subito: non è lentezza
+
+        int raised = Math.Min(MaxReadTimeout, _timeout * 2);
+        if (raised <= _timeout) return false;
+
+        Log?.Invoke($"Una lettura è scaduta dopo {took.TotalSeconds:F0} s mentre il lettore stava " +
+                    $"ancora lavorando: porto l'attesa massima da {_timeout} a {raised} s. " +
+                    "Interromperlo e rifare da capo renderebbe illeggibili settori che si leggono.");
+        _timeout = raised;
+        return true;
+    }
+
+    private void NoteSuccess(long startTimestamp, int sectors)
+    {
+        _bytesDelivered += sectors * 2048L;
+        if (!_throughput.IsRunning) _throughput.Start();
+
+        if (Exploring || _timeout >= MaxReadTimeout) return;
+
+        double took = Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds;
+        if (took < _timeout * 0.6) return;
+
+        int raised = Math.Min(MaxReadTimeout, Math.Max(_timeout * 2, (int)Math.Ceiling(took * 3)));
+        if (raised <= _timeout) return;
+
+        Log?.Invoke($"Il lettore ha impiegato {took:F0} s per una lettura riuscita: alzo l'attesa " +
+                    $"massima da {_timeout} a {raised} s, altrimenti le letture lente verrebbero " +
+                    "interrotte e rifatte da capo.");
+        _timeout = raised;
+    }
+
+    /// <summary>
+    /// Se il lettore arranca, rallentarlo lo fa andare più veloce: a piena velocità sbaglia e
+    /// ritenta per conto suo, a 4x prende il settore al primo colpo. Si fa una volta sola, e
+    /// mai se la velocità l'ha scelta l'utente.
+    /// </summary>
+    private void ConsiderSlowingDown()
+    {
+        if (_slowedDown || SpeedChosenByUser) return;
+        if (_throughput.Elapsed < SlowdownAfter) return;
+
+        double speed = MegabytesPerSecond;
+        if (speed > SlowdownBelowMbPerSec) return;
+
+        _slowedDown = true;
+
+        if (_reader.TrySetReadSpeed(5540))      // 4x
+            Log?.Invoke($"Il lettore sta leggendo a {speed:F2} MB/s: lo porto a 4x. " +
+                        "Sui dischi rovinati rallentare fa andare più veloci, perché il lettore " +
+                        "smette di sbagliare e ritentare da solo.");
+        else
+            Log?.Invoke($"Il lettore sta leggendo a {speed:F2} MB/s e non accetta di essere " +
+                        "rallentato: è il disco, non il programma. Conviene provare un altro lettore.");
+    }
 
     public override int ReadBlocks(long block, int count, byte[] destination, int destinationOffset)
     {
         if (count <= 0) return 0;
+
+        ConsiderSlowingDown();
 
         // Taglio tecnico, non un tentativo fallito: oltre questa dimensione il comando viene
         // rifiutato dall'adattatore anche su un disco perfetto, quindi si spezza e basta.
@@ -180,12 +298,29 @@ public sealed class OpticalBlockSource : BlockSourceBase
         {
             ConsecutiveFailures = 0;
             _readSomething = true;
+            NoteSuccess(started, count);
             return count;
         }
 
         // Da qui in poi si sta ritentando, ed è il tempo che l'utente vede passare guardando
         // un avanzamento fermo: va contato, perché è quello che il tetto limita.
-        _retryTicks += Stopwatch.GetElapsedTime(started).Ticks;
+        var took = Stopwatch.GetElapsedTime(started);
+        _retryTicks += took.Ticks;
+
+        if (TryExtendTimeout(took))
+        {
+            long again = Stopwatch.GetTimestamp();
+
+            if (_reader.Read(block, count, destination, destinationOffset, CurrentTimeout))
+            {
+                ConsecutiveFailures = 0;
+                _readSomething = true;
+                NoteSuccess(again, count);
+                return count;
+            }
+
+            _retryTicks += Stopwatch.GetElapsedTime(again).Ticks;
+        }
 
         if (count == 1) return ReadSingle(block, destination, destinationOffset) ? 1 : 0;
 
@@ -239,6 +374,7 @@ public sealed class OpticalBlockSource : BlockSourceBase
             {
                 ConsecutiveFailures = 0;
                 _readSomething = true;
+                NoteSuccess(started, 1);
                 return true;
             }
 
@@ -247,6 +383,7 @@ public sealed class OpticalBlockSource : BlockSourceBase
             {
                 ConsecutiveFailures = 0;
                 _readSomething = true;
+                NoteSuccess(started, 1);
                 return true;
             }
 
