@@ -264,6 +264,31 @@ Il file è `%APPDATA%\DVDRescue\impostazioni.json`: niente registro e niente ins
 spostare la configurazione su un altro computer basta copiarlo. Se si rovina o si cancella, il
 programma riparte dai valori predefiniti senza lamentarsi.
 
+## I DVD scritti a più riprese
+
+Una videocamera non scrive il DVD-R tutto d'un fiato: ogni sessione diventa una **traccia**, e
+fra una traccia e l'altra restano zone mai scritte. Su un disco così il settore 0 **non risponde
+affatto** — il filesystem ci sarebbe finito solo alla chiusura del disco, che non è mai avvenuta.
+
+Questo rompeva il programma in due modi, e il secondo costava caro.
+
+Il primo: si controllava il settore 0 per decidere se il disco fosse leggibile. Non lo era, e il
+programma se ne andava dicendo *"disco vuoto o illeggibile"* con mezzo gigabyte di riprese
+intatte due settori più in là.
+
+Il secondo: il lettore dichiara esattamente dove ha scritto, e quell'informazione veniva stampata
+nel registro e poi buttata via. La scansione partiva da zero e attraversava le zone mai scritte
+un pezzo alla volta, ritentando su ognuna. Su un disco vero — tracce a 528, 34336 e 34816, ultimo
+settore scritto 248543 — sono **66 MB di nulla** macinati a forza di comandi destinati a fallire:
+venti minuti di attesa per non recuperare niente.
+
+Adesso i tratti dichiarati dal lettore guidano tutto: la calibrazione li usa come banco di prova,
+la verifica del limite cerca un appiglio fra gli inizi delle tracce invece di fissarsi sul settore
+0, e la scansione passa in rassegna solo quelli, saltando il resto senza nemmeno chiederlo. Nel
+collaudo con un disco finto fatto così — due riprese separate da 37 MB mai scritti, settore 0
+morto — il vuoto costa **zero comandi in più**, e le spunte "scansione approfondita" e "recupero
+insistente" non cambiano il tempo: 658 comandi contro 660.
+
 ## Se il primo tentativo non trova niente, ci riprova da solo
 
 Il metodo veloce va bene sulla maggior parte dei dischi, ma su un supporto vecchio o rovinato

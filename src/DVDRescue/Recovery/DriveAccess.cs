@@ -27,6 +27,16 @@ public static class DriveAccess
         public string MediaText = "";
         public string DiscStatusText = "";
         public List<string> Notes = new();
+
+        /// <summary>
+        /// I tratti che il lettore dichiara scritti. Su un DVD-R di videocamera sono più di uno,
+        /// separati da zone mai scritte: saperlo evita sia di cercare il video dove non c'è, sia
+        /// di dare il disco per illeggibile perché non risponde all'inizio.
+        /// </summary>
+        public List<SectorRange> Written = new();
+
+        /// <summary>Primo settore dichiarato scritto, -1 se non si sa.</summary>
+        public long FirstWrittenSector => Written.Count > 0 ? Written[0].First : -1;
     }
 
     public static DriveOpenResult Open(string driveLetter, int readSpeedKbPerSec, bool thorough,
@@ -61,10 +71,6 @@ public static class DriveAccess
                 }
             }
 
-            // Quanto grande può essere una richiesta. Va stabilito subito, perché è il numero
-            // che decide se il disco verrà letto a megabyte o a due chilobyte alla volta.
-            drive.CalibrateTransferSize(log);
-
             var info = drive.ReadDiscInformation();
             if (info != null)
             {
@@ -97,8 +103,32 @@ public static class DriveAccess
                     long end = track.EstimatedLastWrittenLba;
                     log($"Traccia {t}: inizio {track.TrackStart}, dimensione {track.TrackSize}, ultimo scritto {(end >= 0 ? end.ToString() : "n/d")}.");
                     if (end > lastSector) lastSector = end;
+
+                    if (end >= track.TrackStart && track.TrackStart >= 0)
+                        result.Written.Add(new SectorRange(track.TrackStart, end));
                 }
             }
+
+            // Tratti scritti in ordine e senza sovrapposizioni: da qui in poi sono loro a dire
+            // dove guardare, invece dell'intervallo "da zero fino alla fine" che su un disco a
+            // più bordi comprende decine di megabyte mai scritti.
+            result.Written = Merge(result.Written);
+
+            if (result.Written.Count > 0)
+            {
+                long written = result.Written.Sum(r => r.Count);
+                log($"Tratti scritti: {string.Join(", ", result.Written)} " +
+                    $"({written * 2048.0 / 1048576.0:F0} MB effettivi).");
+
+                if (result.Written[0].First > 0)
+                    result.Notes.Add($"I dati non cominciano dall'inizio del disco ma dal settore " +
+                                     $"{result.Written[0].First}: è normale sui DVD scritti a più riprese.");
+            }
+
+            // La calibrazione va fatta adesso, non prima: senza sapere dove sta la roba proverebbe
+            // a leggere il settore 0, che su questi dischi non risponde, e si ridurrebbe a fidarsi
+            // di quello che dichiara il driver.
+            drive.CalibrateTransferSize(log, result.Written.Select(r => r.First));
 
             if (lastSector <= 0)
             {
@@ -135,11 +165,36 @@ public static class DriveAccess
         }
     }
 
+    /// <summary>Unisce e ordina i tratti, fondendo quelli attaccati o sovrapposti.</summary>
+    public static List<SectorRange> Merge(IEnumerable<SectorRange> ranges)
+    {
+        var sorted = ranges.Where(r => r.Last >= r.First).OrderBy(r => r.First).ToList();
+        var merged = new List<SectorRange>();
+
+        foreach (var range in sorted)
+        {
+            if (merged.Count > 0 && range.First <= merged[^1].Last + 1)
+            {
+                merged[^1] = new SectorRange(merged[^1].First, Math.Max(merged[^1].Last, range.Last));
+                continue;
+            }
+            merged.Add(range);
+        }
+
+        return merged;
+    }
+
     /// <summary>
     /// Trova l'ultimo settore davvero leggibile. Va chiamata solo prima di una scansione:
     /// ogni sondaggio a vuoto costa secondi, quindi il numero di tentativi è tenuto basso.
     /// </summary>
+    /// <param name="written">
+    /// Tratti che il lettore dichiara scritti. Senza di questi si finisce per giudicare il disco
+    /// dal settore 0, che su un DVD-R di videocamera non risponde quasi mai — e si scarta come
+    /// illeggibile un disco pieno di riprese.
+    /// </param>
     public static long VerifyWrittenLimit(OpticalBlockSource source, long declared,
+                                          IReadOnlyList<SectorRange> written,
                                           Action<string> log, CancellationToken ct)
     {
         log ??= _ => { };
@@ -147,11 +202,27 @@ public static class DriveAccess
 
         var watch = Stopwatch.StartNew();
 
-        if (!source.ProbeSector(0))
+        // Un punto d'appoggio leggibile: prima gli inizi dei tratti dichiarati scritti, poi
+        // l'inizio del disco. Basta che ne risponda uno.
+        long anchor = -1;
+
+        if (written != null)
+            foreach (var range in written)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (source.ProbeSector(range.First)) { anchor = range.First; break; }
+            }
+
+        if (anchor < 0 && source.ProbeSector(0)) anchor = 0;
+
+        if (anchor < 0)
         {
-            log("Nemmeno il primo settore è leggibile: disco vuoto o illeggibile.");
+            log("Nessun settore leggibile fra quelli dichiarati scritti: disco vuoto o illeggibile.");
             return -1;
         }
+
+        if (anchor > 0)
+            log($"L'inizio del disco non risponde, ma il settore {anchor} sì: i dati cominciano da lì.");
 
         if (source.ProbeSector(declared))
         {
@@ -161,7 +232,7 @@ public static class DriveAccess
 
         log("L'ultimo settore dichiarato non è leggibile: cerco il limite reale (pochi tentativi).");
 
-        long low = 0, high = declared;
+        long low = anchor, high = declared;
         int probes = 0;
         const int maxProbes = 14;     // precisione di circa 1/16000 del disco: più che sufficiente
 

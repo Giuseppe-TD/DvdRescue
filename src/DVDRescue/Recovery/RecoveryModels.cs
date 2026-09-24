@@ -35,6 +35,28 @@ public struct RecoveryRange
     public override string ToString() => $"@{Offset}+{Length}";
 }
 
+/// <summary>
+/// Un tratto di disco che il lettore dichiara scritto, in settori, estremi compresi.
+///
+/// Serve più di quanto sembri. Le videocamere scrivono un DVD-R a più bordi: ogni sessione
+/// diventa una traccia, e fra una traccia e l'altra restano zone mai scritte — illeggibili,
+/// non vuote. Su quei dischi il settore 0 non risponde affatto, perché il filesystem sarebbe
+/// stato scritto lì solo alla chiusura del disco, che non è mai avvenuta. Chi controlla il
+/// settore 0 per decidere se il disco è leggibile conclude che non lo è e se ne va, con mezzo
+/// gigabyte di riprese intatte due settori più in là.
+/// </summary>
+public readonly struct SectorRange
+{
+    public readonly long First;
+    public readonly long Last;
+
+    public SectorRange(long first, long last) { First = first; Last = last; }
+
+    public long Count => Last - First + 1;
+    public bool Contains(long sector) => sector >= First && sector <= Last;
+    public override string ToString() => $"{First}–{Last}";
+}
+
 public sealed class RecoveryTitle
 {
     public int Index;

@@ -44,6 +44,7 @@ internal static class Program
         TestSettings();
         TestDurationAccuracy();
         TestDriveReadPolicy();
+        TestMultiBorderDisc();
         TestBadInput();
 
         Console.WriteLine($"\n=== {(_failures == 0 ? "TUTTI I CONTROLLI SUPERATI" : _failures + " CONTROLLI FALLITI")} ===");
@@ -907,6 +908,85 @@ internal static class Program
             for (long s = 0; s < 4096; s += 512) source.ReadBlocks(s, 512, buffer, 0);
             Check("un disco illeggibile fin dall'inizio non viene dato per finito",
                   !source.ReachedEndOfData);
+        }
+    }
+
+    // --------------------------------------- DVD scritto a più riprese (videocamera)
+
+    /// <summary>
+    /// Il caso che faceva aspettare venti minuti per niente.
+    ///
+    /// Una videocamera scrive il DVD-R a più bordi: ogni sessione è una traccia, e fra una
+    /// traccia e l'altra restano zone mai scritte. Il settore 0 non risponde affatto, perché il
+    /// filesystem ci sarebbe finito solo alla chiusura del disco, che non è mai avvenuta.
+    ///
+    /// Due errori si sommavano. Il primo: si giudicava il disco dal settore 0 e lo si scartava
+    /// come illeggibile, con mezzo giga di riprese intatte due settori più in là. Il secondo,
+    /// più caro: il lettore dichiara esattamente dove ha scritto, e quell'informazione veniva
+    /// buttata via — la scansione partiva da zero e attraversava le zone mai scritte un settore
+    /// alla volta, ritentando su ognuna.
+    /// </summary>
+    private static void TestMultiBorderDisc()
+    {
+        Section("DVD di videocamera scritto a più riprese, inizio disco illeggibile");
+
+        const int total = 40000;                                  // 78 MB
+        var written = new List<SectorRange>
+        {
+            new SectorRange(528, 991),        // prima ripresa, poco dopo l'inizio
+            new SectorRange(20001, 39999)     // seconda ripresa, dopo 37 MB di nulla
+        };
+
+        var disc = MakeFakeDisc(total);
+
+        // fuori dalle tracce il disco non è "vuoto": non risponde proprio
+        for (int s = 0; s < total; s++)
+            if (!written.Any(r => r.Contains(s)))
+                Array.Clear(disc, s * 2048, 2048);
+
+        FakeDrive.SectorState State(long s) =>
+            written.Any(r => r.Contains(s)) ? FakeDrive.SectorState.Good : FakeDrive.SectorState.Dead;
+
+        long writtenSectors = written.Sum(r => r.Count);
+        long gapSectors = total - writtenSectors;
+
+        foreach (var (label, deep, thorough) in new[]
+                 {
+                     ("predefinito", false, ReadEffort.Fast),
+                     ("tutte le spunte", true, ReadEffort.Thorough)
+                 })
+        {
+            var drive = new FakeDrive(disc, 32, State);
+            using var source = new OpticalBlockSource(drive, total) { Effort = thorough };
+
+            long Verify() => DriveAccess.VerifyWrittenLimit(source, total - 1, written, _ => { },
+                                                            CancellationToken.None);
+
+            var result = RecoveryEngine.Analyze(source, deep, Verify, null, _ => { },
+                                                CancellationToken.None,
+                                                preciseSplit: true, allowQuickScan: true, written: written);
+
+            long recovered = result.Titles.Sum(t => t.Bytes) / 2048;
+
+            Console.WriteLine($"  {label,-16}: {result.Titles.Count} video, " +
+                              $"{recovered} settori recuperati su {writtenSectors} scritti, " +
+                              $"{drive.Commands} comandi");
+
+            Check($"{label}: non scarta il disco perché il settore 0 non risponde",
+                  result.Titles.Count > 0, $"{result.Titles.Count} video");
+
+            Check($"{label}: recupera entrambe le riprese",
+                  result.Titles.Count == 2, $"{result.Titles.Count}");
+
+            Check($"{label}: recupera tutti i settori scritti",
+                  recovered >= writtenSectors * 0.98, $"{recovered} su {writtenSectors}");
+
+            // Il conto che conta: il vuoto va attraversato quasi a costo zero. Senza le tracce
+            // servivano migliaia di comandi destinati a fallire, ed è da lì che uscivano i minuti.
+            long budget = writtenSectors / 32 + gapSectors / 512;
+
+            Check($"{label}: non macina le zone mai scritte",
+                  drive.Commands < budget, $"{drive.Commands} comandi, limite {budget}");
         }
     }
 

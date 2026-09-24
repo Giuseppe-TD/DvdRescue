@@ -25,6 +25,11 @@ public static class RecoveryEngine
     /// Vero quando all'utente servono le registrazioni separate: allora i confini vanno cercati
     /// davvero. Falso quando vuole un file unico, e si può prendere tutta l'area scritta.
     /// </param>
+    /// <param name="written">
+    /// I tratti che il lettore dichiara scritti. Su un DVD di videocamera scritto a più riprese
+    /// sono più d'uno e non cominciano da zero: senza questi si passa in rassegna anche decine
+    /// di megabyte mai scritti, e si rischia di dare per illeggibile un disco pieno di riprese.
+    /// </param>
     /// <param name="allowQuickScan">
     /// Falso per andare dritti alla ricerca completa. Serve ai tentativi successivi al primo:
     /// il sondaggio rapido è già stato fatto e non ha trovato niente, rifarlo è tempo buttato.
@@ -33,7 +38,8 @@ public static class RecoveryEngine
                                          Func<long> verifyWrittenLimit,
                                          IProgress<string> progress, Action<string> log,
                                          CancellationToken ct, bool preciseSplit = true,
-                                         bool allowQuickScan = true)
+                                         bool allowQuickScan = true,
+                                         IReadOnlyList<SectorRange> written = null)
     {
         log ??= _ => { };
         var result = new RecoveryResult { Source = source };
@@ -71,23 +77,23 @@ public static class RecoveryEngine
                 case DiscProfile.DvdVideo:
                 case DiscProfile.DvdPartial:
                     if (!BuildFromDvdVideo(cached, result, log, ct))
-                        BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, log, progress, ct);
+                        BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, written, log, progress, ct);
                     break;
 
                 case DiscProfile.DvdVr:
                     if (!BuildFromDvdVr(cached, optical, result, log, ct))
-                        BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, log, progress, ct);
+                        BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, written, log, progress, ct);
                     break;
 
                 case DiscProfile.Bdmv:
                 case DiscProfile.Bdav:
                 case DiscProfile.Avchd:
                     if (!BuildFromBluray(cached, result, log, ct))
-                        BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, log, progress, ct);
+                        BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, written, log, progress, ct);
                     break;
 
                 default:
-                    BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, log, progress, ct);
+                    BuildFromScan(source, optical, result, verifyWrittenLimit, forceDeepScan, preciseSplit, allowQuickScan, written, log, progress, ct);
                     break;
             }
         }
@@ -450,11 +456,16 @@ public static class RecoveryEngine
 
     private static void BuildFromScan(IBlockSource source, OpticalBlockSource optical, RecoveryResult result,
                                       Func<long> verifyWrittenLimit, bool forceDeepScan, bool preciseSplit,
-                                      bool allowQuickScan,
+                                      bool allowQuickScan, IReadOnlyList<SectorRange> written,
                                       Action<string> log, IProgress<string> progress, CancellationToken ct)
     {
         long start = 0;
         long end = source.Length;
+
+        // I tratti da passare in rassegna. Normalmente è uno solo, ma su un DVD scritto a più
+        // riprese sono quelli che il lettore dichiara scritti: fra l'uno e l'altro ci sono zone
+        // mai scritte, e attraversarle non serve a niente se non a far perdere tempo.
+        var toScan = new List<SectorRange>();
 
         // se il filesystem esiste ma le strutture no, si cercano solo i file video:
         // in quel caso l'estensione dell'area scritta non serve e non va cercata
@@ -468,6 +479,7 @@ public static class RecoveryEngine
             log($"File video nel filesystem: {string.Join(", ", videoFiles.Select(f => f.Key))}");
             start = videoFiles.Min(f => f.Value.Offset);
             end = videoFiles.Max(f => f.Value.Offset + f.Value.Length);
+            toScan.Add(new SectorRange(start / 2048, (end - 1) / 2048));
         }
         else
         {
@@ -486,13 +498,35 @@ public static class RecoveryEngine
                 end = (result.LastWrittenSector + 1) * 2048L;
             }
 
+            long lastSector = end / 2048 - 1;
+
+            if (written != null && written.Count > 0)
+            {
+                foreach (var range in written)
+                {
+                    long first = Math.Max(0, range.First);
+                    long final = Math.Min(range.Last, lastSector);
+                    if (final >= first) toScan.Add(new SectorRange(first, final));
+                }
+
+                if (toScan.Count > 0)
+                {
+                    start = toScan[0].First * 2048L;
+                    long skipped = (toScan[^1].Last - toScan[0].First + 1) - toScan.Sum(r => r.Count);
+                    if (skipped > 0)
+                        log($"Salto {skipped * 2048.0 / 1048576.0:F0} MB mai scritti fra un tratto e l'altro.");
+                }
+            }
+
+            if (toScan.Count == 0) toScan.Add(new SectorRange(0, lastSector));
+
             // Se all'utente serve un file solo, i confini fra una registrazione e l'altra non
             // interessano: si prende tutta l'area scritta e si misura la durata con due letture,
             // invece di passare in rassegna un gigabyte alla velocità del lettore.
-            if (!preciseSplit && allowQuickScan && TryQuickScan(source, optical, result, start, end, log, ct))
+            if (!preciseSplit && allowQuickScan && TryQuickScan(source, optical, result, toScan, log, progress, ct))
                 return;
 
-            log($"Ricerca degli stream video fino al settore {end / 2048 - 1}...");
+            log($"Ricerca degli stream video in {toScan.Count} tratto/i, fino al settore {toScan[^1].Last}...");
         }
 
         // Da qui in poi non si esplora più, si recupera: torna in vigore l'impegno richiesto
@@ -502,7 +536,14 @@ public static class RecoveryEngine
         // Program Stream (DVD). Con la scansione approfondita si rinuncia anche ai salti
         // dentro le zone vuote: più lento, ma non può sfuggire nemmeno una clip di un secondo.
         var psCarver = new MpegPsCarver { SkipEmptyAreas = !forceDeepScan };
-        var psSegments = psCarver.Scan(source, start, end, progress, ct);
+        var psSegments = new List<MediaSegment>();
+
+        foreach (var range in toScan)
+        {
+            ct.ThrowIfCancellationRequested();
+            optical?.ResetEndOfData();      // la fine di un tratto non è la fine del disco
+            psSegments.AddRange(psCarver.Scan(source, range.First * 2048L, (range.Last + 1) * 2048L, progress, ct));
+        }
 
         foreach (var segment in psSegments)
         {
@@ -525,7 +566,14 @@ public static class RecoveryEngine
         // Transport Stream (Blu-ray, AVCHD)
         log("Nessun Program Stream: cerco stream in formato Transport Stream...");
         var tsCarver = new TsCarver();
-        var tsSegments = tsCarver.Scan(source, start, end, progress, ct);
+        var tsSegments = new List<Bluray.TsSegment>();
+
+        foreach (var range in toScan)
+        {
+            ct.ThrowIfCancellationRequested();
+            optical?.ResetEndOfData();
+            tsSegments.AddRange(tsCarver.Scan(source, range.First * 2048L, (range.Last + 1) * 2048L, progress, ct));
+        }
 
         foreach (var segment in tsSegments)
         {
@@ -563,23 +611,37 @@ public static class RecoveryEngine
     /// durante l'estrazione.
     /// </summary>
     private static bool TryQuickScan(IBlockSource source, OpticalBlockSource optical, RecoveryResult result,
-                                     long startByte, long endByte, Action<string> log, CancellationToken ct)
+                                     IReadOnlyList<SectorRange> toScan, Action<string> log,
+                                     IProgress<string> progress, CancellationToken ct)
     {
         const int window = 512;   // 1 MB per lettura
-        long lastSector = endByte / 2048 - 1;
-        long firstSector = startByte / 2048;
+        if (toScan.Count == 0) return false;
+
+        long firstSector = toScan[0].First;
+        long lastSector = toScan[^1].Last;
         if (lastSector <= firstSector) return false;
 
         var buffer = new byte[window * 2048];
+        var watch = System.Diagnostics.Stopwatch.StartNew();
 
-        // Un settore solo prima di chiedere il megabyte. Se quello non risponde è quasi certo
-        // che non risponda nemmeno il resto, e insistere su un megabyte di vuoto vuol dire
-        // centinaia di comandi buttati: è esattamente quello che faceva aspettare minuti.
-        bool Readable(long sector) => optical == null || optical.ProbeSector(sector);
+        // Un settore prima di chiedere il megabyte: se non risponde è quasi certo che non
+        // risponda nemmeno il resto, e insistere su un megabyte di vuoto vuol dire centinaia di
+        // comandi buttati. Se ne prova più d'uno, però: su un disco scritto a più riprese un
+        // tratto buono può cominciare a metà del megabyte, e fermarsi al primo settore vuol dire
+        // scavalcare una registrazione intera.
+        bool Readable(long sector, int count)
+        {
+            if (optical == null) return true;
+
+            for (int i = 0; i < count; i += 64)
+                if (optical.ProbeSector(sector + i)) return true;
+
+            return false;
+        }
 
         long FirstVideoIn(long sector, int count)
         {
-            if (count <= 0 || !Readable(sector)) return -1;
+            if (count <= 0 || !Readable(sector, count)) return -1;
 
             source.ReadBlocks(sector, count, buffer, 0);
 
@@ -591,26 +653,38 @@ public static class RecoveryEngine
 
         // ------------------------------------------------------------- inizio del video
         // Non sempre comincia subito: su un disco formattato in modalità VR la testa è occupata
-        // da strutture e riserve, e il video parte anche parecchio più avanti. I primi megabyte
-        // si leggono quindi di seguito, così una ripresa breve in testa non sfugge; poi si
-        // assaggia a salti fino in fondo all'area scritta, invece di arrendersi a metà disco.
+        // da strutture e riserve, e su un DVD scritto a più riprese il primo tratto comincia
+        // dove dice il lettore, non a zero. I primi megabyte di ogni tratto si leggono di
+        // seguito, così una ripresa breve non sfugge; poi si assaggia a salti.
         long probeStep = window * 8;                          // un assaggio ogni 8 MB
-        long contiguousUntil = firstSector + window * 16;     // primi 16 MB letti di seguito
         long foundAt = -1;
-        long step = window;
-        long sector = firstSector;
 
-        while (sector <= lastSector && foundAt < 0)
+        foreach (var range in toScan)
         {
-            ct.ThrowIfCancellationRequested();
+            long contiguousUntil = range.First + window * 16;   // primi 16 MB del tratto
+            long step = window;
+            long sector = range.First;
 
-            int count = (int)Math.Min(window, lastSector - sector + 1);
-            if (count <= 0) break;
+            while (sector <= range.Last && foundAt < 0)
+            {
+                ct.ThrowIfCancellationRequested();
 
-            foundAt = FirstVideoIn(sector, count);
+                int count = (int)Math.Min(window, range.Last - sector + 1);
+                if (count <= 0) break;
 
-            sector += step;
-            if (sector >= contiguousUntil) step = probeStep;
+                foundAt = FirstVideoIn(sector, count);
+
+                sector += step;
+                if (sector >= contiguousUntil) step = probeStep;
+
+                if (watch.ElapsedMilliseconds > 500)
+                {
+                    watch.Restart();
+                    progress?.Report($"Cerco l'inizio del video: settore {sector} di {lastSector}");
+                }
+            }
+
+            if (foundAt >= 0) break;
         }
 
         if (foundAt < 0)
@@ -646,7 +720,7 @@ public static class RecoveryEngine
             int count = (int)Math.Min(window, lastSector - s + 1);
             if (count <= 0) break;
 
-            if (Readable(s))
+            if (Readable(s, count))
             {
                 source.ReadBlocks(s, count, buffer, 0);
 
@@ -660,8 +734,29 @@ public static class RecoveryEngine
         if (end < 0) end = lastSector;
         if (end <= start) return false;
 
-        long length = (end - start + 1) * 2048L;
-        double seconds = MpegPsCarver.MeasureSeconds(source, start * 2048L, length, out double density);
+        // Il titolo copre solo i tratti davvero scritti: su un disco a più riprese le zone fra
+        // l'uno e l'altro non sono video e non devono finire nel file né nel conteggio.
+        var pieces = new List<RecoveryRange>();
+
+        foreach (var range in toScan)
+        {
+            long from = Math.Max(range.First, start);
+            long to = Math.Min(range.Last, end);
+            if (to >= from) pieces.Add(new RecoveryRange(from * 2048L, (to - from + 1) * 2048L));
+        }
+
+        if (pieces.Count == 0) return false;
+
+        long length = pieces.Sum(p => p.Length);
+        double seconds = 0, density = 0;
+
+        foreach (var piece in pieces)
+        {
+            seconds += MpegPsCarver.MeasureSeconds(source, piece.Offset, piece.Length, out double d);
+            density += d * piece.Length;
+        }
+
+        density = length > 0 ? density / length : 0;
 
         // La lettura rapida si regge su un'assunzione: fra il primo e l'ultimo settore video c'è
         // video, non buchi. Sui dischi di famiglia è vera, ma su un DVD-RW con registrazioni
@@ -678,9 +773,9 @@ public static class RecoveryEngine
         result.Titles.Add(new RecoveryTitle
         {
             Name = "registrazione completa",
-            Origin = "area scritta del disco",
+            Origin = pieces.Count > 1 ? $"area scritta del disco ({pieces.Count} tratti)" : "area scritta del disco",
             Seconds = seconds,
-            Ranges = { new RecoveryRange(start * 2048L, length) }
+            Ranges = pieces
         });
 
         result.QuickScan = true;

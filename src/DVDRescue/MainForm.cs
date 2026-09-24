@@ -21,6 +21,9 @@ public partial class MainForm : Form
 
     private readonly ConcurrentQueue<string> _logQueue = new();
     private volatile ProgressReport _lastProgress;
+    private DateTime _busySince;
+    private string _phase = "";
+    private int _percent;
     private readonly System.Windows.Forms.Timer _uiTimer = new() { Interval = 200 };
 
     public MainForm()
@@ -359,7 +362,10 @@ public partial class MainForm : Form
         {
             var sb = new System.Text.StringBuilder();
             while (_logQueue.TryDequeue(out string line))
+            {
                 sb.AppendLine($"[{DateTime.Now:HH:mm:ss}] {line}");
+                _phase = line;
+            }
             txtLog.AppendText(sb.ToString());
         }
 
@@ -367,11 +373,30 @@ public partial class MainForm : Form
         if (progress != null)
         {
             _lastProgress = null;
-            int value = (int)Math.Max(0, Math.Min(100, progress.Percent));
-            if (progressBar.Value != value) progressBar.Value = value;
-            lblStatus.Text = $"{progress.Stage}: {progress.Detail}  ({value}%)";
+            _percent = (int)Math.Max(0, Math.Min(100, progress.Percent));
+            _phase = $"{progress.Stage}: {progress.Detail}";
         }
+
+        if (!_busy) return;
+
+        // Segno di vita.
+        //
+        // Cercare dove comincia il video su un disco messo male vuol dire sondare settori che il
+        // lettore ci mette secondi a rifiutare: per minuti interi non c'è niente da riportare, e
+        // senza questo l'ultima scritta rimasta sullo schermo era "Pronto." — quella della lettura
+        // precedente. Il programma stava lavorando e sembrava piantato.
+        if (progressBar.Value != _percent) progressBar.Value = _percent;
+
+        var elapsed = DateTime.Now - _busySince;
+        string spinner = "|/-\\"[(int)(elapsed.TotalMilliseconds / 250) % 4].ToString();
+        string detail = string.IsNullOrWhiteSpace(_phase) ? "lettura in corso" : Shorten(_phase);
+
+        lblStatus.Text = $"{spinner}  {detail}  —  {elapsed:mm\\:ss}" +
+                         (_percent > 0 ? $"  ({_percent}%)" : "");
     }
+
+    private static string Shorten(string text) =>
+        text.Length <= 90 ? text : text.Substring(0, 87) + "...";
 
     private void Log(string message) => _logQueue.Enqueue(message);
 
@@ -384,6 +409,14 @@ public partial class MainForm : Form
     private void SetBusy(bool busy)
     {
         _busy = busy;
+
+        if (busy)
+        {
+            _busySince = DateTime.Now;
+            _phase = "";
+            _percent = 0;
+        }
+
         btnRead.Enabled = !busy;
         btnOpenImage.Enabled = !busy;
         btnRefreshDrives.Enabled = !busy;
@@ -505,6 +538,7 @@ public partial class MainForm : Form
         try
         {
             Func<long> verifyLimit = null;
+            List<SectorRange> writtenRanges = null;
             string mediaText = "", statusText = "";
             var watch = System.Diagnostics.Stopwatch.StartNew();
 
@@ -544,6 +578,7 @@ public partial class MainForm : Form
                 _source = opened.Source;
                 mediaText = opened.MediaText;
                 statusText = opened.DiscStatusText;
+                writtenRanges = opened.Written;
                 foreach (var note in opened.Notes) Log("Nota: " + note);
 
                 // La ricerca del limite dell'area scritta viene fatta solo se serve la scansione,
@@ -555,7 +590,8 @@ public partial class MainForm : Form
                 {
                     if (cachedLimit == long.MinValue)
                     {
-                        cachedLimit = DriveAccess.VerifyWrittenLimit(opened.Source, opened.EstimatedLastSector, Log, ct);
+                        cachedLimit = DriveAccess.VerifyWrittenLimit(opened.Source, opened.EstimatedLastSector,
+                                                                     opened.Written, Log, ct);
 
                         if (cachedLimit > 0)
                         {
@@ -587,6 +623,7 @@ public partial class MainForm : Form
             var textProgress = CreateTextProgress();
 
             var optical = _source as OpticalBlockSource;
+            var written = writtenRanges;
 
             async Task<RecoveryResult> AttemptAsync(ReadEffort effort, bool deepScan, bool quickScan)
             {
@@ -599,7 +636,7 @@ public partial class MainForm : Form
                 return await Task.Run(() =>
                 {
                     var r = RecoveryEngine.Analyze(source, deepScan, verifyLimit, textProgress, Log, ct,
-                                                   preciseSplit, quickScan);
+                                                   preciseSplit, quickScan, written);
                     r.MediaText = mediaText;
                     r.DiscStatusText = statusText;
                     return r;

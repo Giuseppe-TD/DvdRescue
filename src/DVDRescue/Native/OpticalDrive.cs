@@ -341,7 +341,13 @@ public sealed class OpticalDrive : ISectorReader, IDisposable
     /// prova sul serio, perché il tetto dichiarato e quello vero non sempre coincidono.
     /// Costa una manciata di comandi e fa risparmiare ore.
     /// </summary>
-    public void CalibrateTransferSize(Action<string> log)
+    /// <param name="candidates">
+    /// Settori da usare come banco di prova, dal più promettente in giù. Vanno passati gli inizi
+    /// delle tracce scritte: su un DVD-R di videocamera il settore 0 non risponde, perché il
+    /// filesystem ci sarebbe finito solo alla chiusura del disco. Senza questi, la calibrazione
+    /// non trova niente da leggere e si limita a fidarsi del driver.
+    /// </param>
+    public void CalibrateTransferSize(Action<string> log, IEnumerable<long> candidates = null)
     {
         log ??= _ => { };
 
@@ -349,7 +355,7 @@ public sealed class OpticalDrive : ISectorReader, IDisposable
         int ceiling = declaredBytes > 0 ? Math.Min(declaredBytes / SectorSize, 128) : 128;
         if (ceiling < 1) ceiling = 1;
 
-        long reference = FindReadableSector();
+        long reference = FindReadableSector(candidates);
 
         if (reference < 0)
         {
@@ -379,12 +385,24 @@ public sealed class OpticalDrive : ISectorReader, IDisposable
         log($"Trasferimento massimo: {TransferSizeInfo}.");
     }
 
-    /// <summary>Primo settore leggibile fra alcuni punti tipici: serve solo come banco di prova.</summary>
-    private long FindReadableSector()
+    /// <summary>Primo settore leggibile fra quelli proposti: serve solo come banco di prova.</summary>
+    private long FindReadableSector(IEnumerable<long> candidates)
     {
         var one = new byte[SectorSize];
+
+        var list = new List<long>();
+        if (candidates != null) list.AddRange(candidates);
+
+        // ripiego per quando non si sa ancora dove sta la roba
         foreach (long lba in new long[] { 0, 16, 256, 1024, 4096 })
+            if (!list.Contains(lba)) list.Add(lba);
+
+        foreach (long lba in list)
+        {
+            if (lba < 0) continue;
             if (ReadSectorsRaw(lba, 1, one, 0, 3).Success) return lba;
+        }
+
         return -1;
     }
 
